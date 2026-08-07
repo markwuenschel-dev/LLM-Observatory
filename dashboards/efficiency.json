@@ -1,0 +1,19 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "panels": [
+    {"type": "stat", "id": 1, "title": "Input tokens", "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "observatory_input_tokens_total", "refId": "A"}]},
+    {"type": "stat", "id": 2, "title": "Output tokens", "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "observatory_output_tokens_total", "refId": "A"}]},
+    {"type": "stat", "id": 3, "title": "Cached tokens", "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "observatory_cached_tokens_total", "refId": "A"}]},
+    {"type": "stat", "id": 4, "title": "Average latency (ms)", "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "observatory_latency_average_ms", "refId": "A"}]},
+    {"type": "timeseries", "id": 5, "title": "Usage evidence classes", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "observatory_events_by_usage_source_total", "legendFormat": "{{source}}", "refId": "A"}]},
+    {"type": "timeseries", "id": 6, "title": "Model operation volume", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(30, observatory_events_by_provider_model_total)", "legendFormat": "{{provider}} / {{model}} / {{client}}", "refId": "A"}]},
+    {"type": "text", "id": 7, "title": "Efficiency boundary", "gridPos": {"h": 6, "w": 24, "x": 0, "y": 12}, "options": {"mode": "markdown", "content": "Totals are metadata aggregates, not billing statements. Compare token and cost values only when their evidence source and unit semantics match. Missing values are not zero observations. Prometheus values are current store snapshots; use API `start`/`end` filters for time-bounded analysis."}}
+  ],
+  "schemaVersion": 39,
+  "tags": ["llm", "efficiency", "metadata-first"],
+  "time": {"from": "now-24h", "to": "now"},
+  "title": "Efficiency and Usage",
+  "uid": "efficiency-usage",
+  "version": 1
+}

@@ -1,0 +1,15 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "panels": [
+    {"type": "timeseries", "id": 1, "title": "Execution role/skill/lane volume", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(50, observatory_events_by_execution_total)", "legendFormat": "{{role}} / {{skill}} / {{lane}}", "refId": "A"}]},
+    {"type": "timeseries", "id": 2, "title": "Client route/auth volume", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(50, observatory_events_by_client_route_total)", "legendFormat": "{{client}} / {{route}} / {{auth_mode}}", "refId": "A"}]},
+    {"type": "traces", "id": 3, "title": "Trace explorer", "gridPos": {"h": 10, "w": 24, "x": 0, "y": 8}, "datasource": {"type": "tempo", "uid": "tempo"}, "targets": [{"queryType": "traceql", "query": "{}", "refId": "A"}]},
+    {"type": "text", "id": 4, "title": "Hierarchy boundary", "gridPos": {"h": 5, "w": 24, "x": 0, "y": 18}, "options": {"mode": "markdown", "content": "Session, workflow, agent, subagent, parent, and tool relationships are retained when the source supplies them. Missing hierarchy is represented as unknown rather than fabricated. High-cardinality IDs belong in the event detail/attribution API and Tempo, not Prometheus labels. Prometheus values are current store snapshots; use API `start`/`end` filters for time-bounded analysis."}}
+  ],
+  "schemaVersion": 39,
+  "time": {"from": "now-24h", "to": "now"},
+  "title": "Agent and Session Explorer",
+  "uid": "execution-explorer",
+  "version": 1
+}

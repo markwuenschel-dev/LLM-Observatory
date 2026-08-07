@@ -1,0 +1,136 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Observed events",
+      "id": 1,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "sum(observatory_events_by_context_total{project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",provider=~\"$provider\",model=~\"$model\",model_family=~\"$model_family\",client=~\"$client\",auth_mode=~\"$auth_mode\",route=~\"$route\",agent=~\"$agent\",subagent=~\"$subagent\",role=~\"$role\",skill=~\"$skill\",lane=~\"$lane\",workflow=~\"$workflow\",task_class=~\"$task_class\",status=~\"$status\"})", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto"}
+    },
+    {
+      "type": "stat",
+      "title": "Successful operations",
+      "id": 2,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "sum(observatory_events_by_context_total{project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",provider=~\"$provider\",model=~\"$model\",model_family=~\"$model_family\",client=~\"$client\",auth_mode=~\"$auth_mode\",route=~\"$route\",agent=~\"$agent\",subagent=~\"$subagent\",role=~\"$role\",skill=~\"$skill\",lane=~\"$lane\",workflow=~\"$workflow\",task_class=~\"$task_class\",status=~\"success|succeeded|ok\"})", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto"}
+    },
+    {
+      "type": "stat",
+      "title": "Failed operations",
+      "id": 3,
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "sum(observatory_events_by_context_total{project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",provider=~\"$provider\",model=~\"$model\",model_family=~\"$model_family\",client=~\"$client\",auth_mode=~\"$auth_mode\",route=~\"$route\",agent=~\"$agent\",subagent=~\"$subagent\",role=~\"$role\",skill=~\"$skill\",lane=~\"$lane\",workflow=~\"$workflow\",task_class=~\"$task_class\",status=~\"failed|failure|error\"})", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto"}
+    },
+    {
+      "type": "stat",
+      "title": "Conflicting replays",
+      "id": 4,
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "observatory_event_conflicts_total", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto"}
+    },
+    {
+      "type": "timeseries",
+      "title": "Observed operations by provider and model",
+      "id": 5,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "topk(20, observatory_events_by_context_total{project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",provider=~\"$provider\",model=~\"$model\",model_family=~\"$model_family\",client=~\"$client\",auth_mode=~\"$auth_mode\",route=~\"$route\",agent=~\"$agent\",subagent=~\"$subagent\",role=~\"$role\",skill=~\"$skill\",lane=~\"$lane\",workflow=~\"$workflow\",task_class=~\"$task_class\",status=~\"$status\"})", "legendFormat": "{{project}} / {{repository}} / {{branch}} / {{provider}} / {{model}} / {{client}} / {{agent}} / {{subagent}} / {{skill}} / {{workflow}} / {{status}}", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "palette-classic"}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Usage evidence classes",
+      "id": 6,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "observatory_events_by_usage_source_total", "legendFormat": "{{source}}", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "palette-classic"}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "type": "logs",
+      "title": "Telemetry diagnostics",
+      "id": 7,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "datasource": {"type": "loki", "uid": "loki"},
+      "targets": [{"expr": "{service_name=\"otel-collector\"}", "refId": "A"}],
+      "options": {"showTime": true, "showUniqueLabels": false, "wrapLines": false, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending"}
+    },
+    {
+      "type": "stat",
+      "title": "Normalizer ready",
+      "id": 9,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "observatory_process_ready", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto"}
+    },
+    {
+      "type": "stat",
+      "title": "Rejected intake records",
+      "id": 10,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "observatory_ingest_rejected_total", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto"}
+    },
+    {
+      "type": "stat",
+      "title": "Normalizer uptime",
+      "id": 11,
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "observatory_process_uptime_seconds", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto"}
+    },
+    {
+      "type": "text",
+      "title": "Evidence boundary",
+      "id": 8,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "options": {"mode": "markdown", "content": "**ALL PROJECTS** is the default scope. Counts describe observed and correlated telemetry; they do not prove that a model caused an outcome.\n\nToken and cost comparisons are only comparable when their provenance and billing semantics match. `provider`, `client`, `gateway`, `estimated`, and `derived` evidence remain distinct in the normalized store. Prometheus values are current store snapshots; use API `start`/`end` filters for time-bounded analysis."}
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["llm", "observability", "metadata-first"],
+  "templating": {
+    "list": [
+      {"name": "project", "label": "Project", "type": "query", "query": "label_values(observatory_events_by_context_total, project)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL PROJECTS", "value": "$__all"}},
+      {"name": "repository", "label": "Repository", "type": "query", "query": "label_values(observatory_events_by_context_total, repository)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "branch", "label": "Branch", "type": "query", "query": "label_values(observatory_events_by_context_total, branch)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "provider", "label": "Provider", "type": "query", "query": "label_values(observatory_events_by_context_total, provider)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "model", "label": "Model", "type": "query", "query": "label_values(observatory_events_by_context_total, model)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "model_family", "label": "Model family", "type": "query", "query": "label_values(observatory_events_by_context_total, model_family)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "client", "label": "Client", "type": "query", "query": "label_values(observatory_events_by_context_total, client)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "auth_mode", "label": "Auth mode", "type": "query", "query": "label_values(observatory_events_by_context_total, auth_mode)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "route", "label": "Route", "type": "query", "query": "label_values(observatory_events_by_context_total, route)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "agent", "label": "Agent", "type": "query", "query": "label_values(observatory_events_by_context_total, agent)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "subagent", "label": "Subagent", "type": "query", "query": "label_values(observatory_events_by_context_total, subagent)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "role", "label": "Agent role", "type": "query", "query": "label_values(observatory_events_by_context_total, role)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "skill", "label": "Skill", "type": "query", "query": "label_values(observatory_events_by_context_total, skill)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "lane", "label": "Lane", "type": "query", "query": "label_values(observatory_events_by_context_total, lane)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "workflow", "label": "Workflow", "type": "query", "query": "label_values(observatory_events_by_context_total, workflow)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "task_class", "label": "Task class", "type": "query", "query": "label_values(observatory_events_by_context_total, task_class)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+      {"name": "status", "label": "Status", "type": "query", "query": "label_values(observatory_events_by_context_total, status)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}}
+    ]
+  },
+  "time": {"from": "now-24h", "to": "now"},
+  "title": "Global Observatory",
+  "uid": "global-observatory",
+  "version": 1
+}

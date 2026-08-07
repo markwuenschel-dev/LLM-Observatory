@@ -1,0 +1,26 @@
+ALTER TABLE events ADD COLUMN model_family TEXT;
+ALTER TABLE events ADD COLUMN reasoning_effort TEXT;
+ALTER TABLE events ADD COLUMN branch TEXT;
+ALTER TABLE events ADD COLUMN commit_sha TEXT;
+ALTER TABLE events ADD COLUMN worktree TEXT;
+ALTER TABLE events ADD COLUMN role TEXT;
+ALTER TABLE events ADD COLUMN skill TEXT;
+ALTER TABLE events ADD COLUMN lane TEXT;
+ALTER TABLE events ADD COLUMN outcome_kind TEXT;
+ALTER TABLE events ADD COLUMN outcome_status TEXT;
+ALTER TABLE events ADD COLUMN cached_tokens REAL;
+ALTER TABLE events ADD COLUMN reasoning_tokens REAL;
+ALTER TABLE events ADD COLUMN cost REAL;
+ALTER TABLE events ADD COLUMN latency_ms REAL;
+ALTER TABLE events ADD COLUMN time_to_first_token_ms REAL;
+ALTER TABLE events ADD COLUMN duration_ms REAL;
+ALTER TABLE events ADD COLUMN retry_count REAL;
+ALTER TABLE events ADD COLUMN rate_limited INTEGER;
+
+CREATE INDEX IF NOT EXISTS idx_events_session ON events (session_id);
+CREATE INDEX IF NOT EXISTS idx_events_workflow ON events (workflow_id);
+CREATE INDEX IF NOT EXISTS idx_events_agent ON events (agent_id, subagent_id);
+CREATE INDEX IF NOT EXISTS idx_events_execution_dimensions ON events (role, skill, lane);
+CREATE INDEX IF NOT EXISTS idx_events_route_auth ON events (route, auth_mode);
+CREATE INDEX IF NOT EXISTS idx_events_outcome ON events (outcome_kind, outcome_status);
+CREATE INDEX IF NOT EXISTS idx_events_branch_commit ON events (branch, commit_sha);

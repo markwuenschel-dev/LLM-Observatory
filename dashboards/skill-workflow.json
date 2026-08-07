@@ -1,0 +1,16 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "panels": [
+    {"type": "timeseries", "id": 1, "title": "Skill / role / lane volume", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(50, observatory_events_by_execution_total)", "legendFormat": "{{skill}} / {{role}} / {{lane}}", "refId": "A"}]},
+    {"type": "timeseries", "id": 2, "title": "Workflow volume", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(50, observatory_events_by_workflow_total)", "legendFormat": "{{workflow}}", "refId": "A"}]},
+    {"type": "timeseries", "id": 3, "title": "Agent volume", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(50, observatory_events_by_agent_total)", "legendFormat": "{{agent}}", "refId": "A"}]},
+    {"type": "text", "id": 4, "title": "Execution boundary", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}, "options": {"mode": "markdown", "content": "Execution identities are source-reported dimensions. Missing or provider-specific hierarchy remains `unknown`; this view does not infer parentage or claim that a skill caused an outcome. Prometheus values are current store snapshots; use API `start`/`end` filters for time-bounded analysis."}}
+  ],
+  "schemaVersion": 39,
+  "tags": ["llm", "skills", "workflows", "agents"],
+  "time": {"from": "now-24h", "to": "now"},
+  "title": "Skills and Workflows",
+  "uid": "skill-workflow",
+  "version": 1
+}

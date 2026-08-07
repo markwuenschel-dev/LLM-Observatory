@@ -1,0 +1,149 @@
+name: llm-observatory
+
+services:
+  observatory-api:
+    build:
+      context: .
+    image: llm-observatory-api:0.1.0
+    command: ["python", "-m", "observatory.cli", "--state-dir", "/var/lib/observatory", "run-api", "--host", "0.0.0.0", "--port", "8787"]
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    volumes:
+      - ${OBSERVATORY_STATE_DIR:?Run observatory install before starting Compose}:/var/lib/observatory
+    ports:
+      - "127.0.0.1:8787:8787"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:${OTEL_COLLECTOR_TAG:-0.158.0}
+    command: ["--config=/etc/otelcol/config.yaml"]
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    volumes:
+      - ./deployment/otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+      - otel-queue:/var/lib/otelcol
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:13133:13133"
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol/config.yaml"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      observatory-api:
+        condition: service_healthy
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+
+  tempo:
+    image: grafana/tempo:${TEMPO_TAG:-3.0.0}
+    command: ["-config.file=/etc/tempo/tempo.yaml", "-config.expand-env=true"]
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 1.0
+    environment:
+      TEMPO_RETENTION: ${TEMPO_RETENTION:-720h}
+    volumes:
+      - ./deployment/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    expose:
+      - "3200"
+      - "4317"
+      - "4318"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3200/ready >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  loki:
+    image: grafana/loki:${LOKI_TAG:-3.5.0}
+    command: ["-config.file=/etc/loki/loki.yaml", "-config.expand-env=true"]
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    environment:
+      LOKI_RETENTION: ${LOKI_RETENTION:-336h}
+    volumes:
+      - ./deployment/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    expose:
+      - "3100"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3100/ready >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:${PROMETHEUS_TAG:-v3.5.0}
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus", "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-30d}", "--storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-8GB}"]
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    volumes:
+      - ./deployment/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    expose:
+      - "9090"
+    depends_on:
+      observatory-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9090/-/ready >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana:${GRAFANA_TAG:-12.1.0}
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://127.0.0.1:3000
+    secrets:
+      - grafana_admin_password
+    volumes:
+      - ./deployment/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      tempo:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/api/health >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  otel-queue:
+  tempo-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:
+
+secrets:
+  grafana_admin_password:
+    file: ${OBSERVATORY_SECRET_FILE:?Run observatory install before starting Compose}
