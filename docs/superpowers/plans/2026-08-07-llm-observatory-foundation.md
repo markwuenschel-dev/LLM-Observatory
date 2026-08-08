@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Current execution status (2026-08-08):** Tasks 1–8 below are implemented in the current working tree. Their focused commands and the full suite are green; the disposable Docker, queue-saturation, and independent seam checks are recorded in [`docs/production-readiness.md`](../../production-readiness.md). The remaining open *release* boundaries are external: a post-fix real-client emission, a stable-state host reboot, a human visual sweep, off-host encrypted recovery, and signed image promotion. Historical “initial failure” wording is retained only as context and does not describe the current checkout.
+
 **Goal:** Build the first production-useful vertical slice of a provider-agnostic LLM Observatory: metadata-first event intake, explicit provenance and privacy contracts, automatic Git project attribution, a durable local store, an out-of-band OTel/Grafana deployment, and a diagnostic CLI.
 
 **Architecture:** A host-side Python package owns normalized event contracts, redaction, project resolution, SQLite persistence, and the `observatory` CLI. Native client telemetry is optional and goes to a localhost-only OpenTelemetry Collector; the Collector exports traces and metrics to Grafana-compatible backends without entering an inference path. A Docker Compose stack provides the Collector, Tempo, Prometheus, Grafana, and the host API as independently restartable services. Provider/client adapters are capability-declared and may emit partial metadata; they must never invent authoritative usage or require repository files.
@@ -26,23 +28,25 @@
 
 ## Current-State Truth
 
+> This plan records the initial design and work packages. The live implementation and release verdict are maintained in [`docs/production-readiness.md`](../../production-readiness.md); the rows below describe the current checkout rather than the original empty-tree assumption.
+
 | Area | Current status | Classification | Canonical owner | Evidence | Known gap | Next relevant action |
 |---|---|---|---|---|---|---|
-| Repository | Empty Git checkout on `main`; no commits or tracked files | Confirmed | This working tree | `git status --short --branch`, `Get-ChildItem -Force` | No project conventions, tests, or baseline | Establish package layout and initial commit-ready files |
-| Host | Windows; Python 3.14.6; Node 25.2.0; Docker 29.6.2; Compose 5.3.1 | Verified locally | Host environment | Version commands in task log | Docker config access warning in sandbox | Add `doctor` diagnostics and verify Compose independently |
-| Installed clients | Claude Code 2.1.224, Codex executable present but blocked by local access policy, Cursor 3.14.27, Kimi 0.28.1; Gemini/OpenRouter CLIs absent | Verified locally / blocked | Capability registry | `Get-Command`, `--version` commands | Native telemetry details still need first-party evidence | Maintain capability matrix with confidence states |
-| Telemetry foundation | Current OTel docs expose Collector pipelines, memory limiting, batching, queued exporters, and evolving GenAI conventions | Verified from current first-party docs | OTel Collector configuration | Context7 sources under `open-telemetry` | Exact component versions and client support vary | Pin Compose images and validate configs |
-| Visualization | Grafana supports file provisioning; Tempo supports persistent single-binary Docker storage | Verified from current first-party docs | Provisioned Grafana/Tempo files | Context7 sources under `grafana` | Runtime container startup not yet proven | Add provisioning files and static validation |
+| Repository | Dirty working tree over the initial commit; implementation, tests, dashboards, deployment, and scripts are present but not committed | Verified locally | This working tree | `git status --short`, `git log -1 --oneline` | Changes still require an intentional review/commit boundary | Review the diff, then commit only when the owner requests it |
+| Host | Windows; Python 3.14.x; Docker Engine 29.6.2 is available to the runtime gate | Verified locally | Host environment | Runtime acceptance output and local version probes | Docker Desktop/host reboot and off-host recovery remain operator gates | Run the documented host-reboot and recovery checks |
+| Installed clients | Claude Code 2.1.226, Codex executable present but blocked by local access policy, Cursor 3.14.27, Kimi 0.28.1, and Grok 0.2.118; Gemini/OpenRouter CLIs absent | Verified locally / blocked | Capability registry | Capability matrix, bounded `--version` probes, and `doctor` | Real provider emission and subscription-mode behavior remain unverified | Run the explicit operator-authorized provider acceptance harness |
+| Telemetry foundation | OTel Collector, host normalizer, SQLite ledger, Tempo, Loki, Prometheus, and Grafana are implemented with bounded queues, privacy allowlists, and restart-durable volumes | Verified locally and in disposable runtime | OTel Collector configuration and normalized contract | Full test suite, `scripts/verify.py`, and `scripts/runtime-acceptance.ps1` | Immutable image promotion and host-loss recovery remain external gates | Record approved image digests and rehearse off-host restore |
+| Visualization | Ten provisioned Grafana dashboards execute their metric/log/trace targets and event-time queries in the disposable runtime gate | Query/runtime verified; visual review pending | Provisioned Grafana/Tempo files | Runtime dashboard sweep and `docs/production-readiness.md` | Human visual usability review is not automated | Perform the documented visual sweep before production sign-off |
 
 ## Facts, Assumptions, and Unknowns
 
 - **Fact:** The repository is greenfield, so a clean initial architecture can be established without migration of existing application contracts.
 - **Fact:** The host is Windows and has Docker/Compose binaries, but this sandbox reported access warnings for Docker's user config; `doctor` must surface that as a diagnosis rather than hiding it.
-- **Fact:** OTel GenAI semantic conventions are evolving; experimental attributes and provider-specific fields must be versioned and labeled.
+- **Fact:** OTel GenAI semantic conventions are evolving; experimental attributes and provider-specific fields are versioned and labeled.
 - **Assumption:** The first deployment is single-user, single-host, private, and local-network-only. The persistence interface remains replaceable for a later PostgreSQL or analytical backend.
 - **Assumption:** Native telemetry is unavailable or inconsistent for some subscription clients. The initial adapter contract therefore supports global logs/hooks/exports and explicitly represents missing fields.
-- **Unknown:** Exact current telemetry behavior and supported global configuration of each installed client. No adapter may claim support until the capability lane records evidence.
-- **Unknown:** Whether Docker Desktop is running and whether all pinned images can be pulled in this environment. Static validation must not be confused with runtime proof.
+- **Fact:** Current first-party capability evidence and bounded local probes are recorded in `docs/capability-evidence.md` and `docs/capability-matrix.yaml`; unverified modes remain explicitly partial or unknown.
+- **Fact:** The pinned images and current disposable Compose profile pass the runtime gate; the stable host state after the recent reboot still requires an operator reinstall/restart check.
 
 ## Source-of-Truth and Authority Map
 
@@ -82,11 +86,11 @@ The inference flow is deliberately absent from this graph. A client may emit tel
   "received_at": "2026-08-07T14:00:01Z",
   "source": {"kind": "client", "name": "example", "version": "unknown"},
   "project": {"project_id": "repo:sha256:...", "repository": "example", "root": "C:/work/example", "remote": null, "branch": null, "commit": null, "worktree": null},
-  "execution": {"trace_id": null, "span_id": null, "parent_event_id": null, "session_id": null, "workflow_id": null, "agent_id": null, "subagent_id": null, "role": null, "skill": null, "lane": null},
+  "execution": {"trace_id": null, "span_id": null, "parent_event_id": null, "session_id": null, "workflow_id": null, "agent_id": null, "subagent_id": null, "parent_agent_id": null, "role": null, "skill": null, "lane": null},
   "llm": {"provider": "unknown", "model": "unknown", "model_family": null, "client": "example", "auth_mode": "unknown", "route": "unknown", "reasoning_effort": null},
   "usage": {"input_tokens": null, "output_tokens": null, "cached_tokens": null, "reasoning_tokens": null, "total_tokens": null, "cost": null, "source": "unknown"},
   "performance": {"latency_ms": null, "time_to_first_token_ms": null, "duration_ms": null},
-  "reliability": {"status": "unknown", "error_kind": null, "retry_count": null, "rate_limited": null},
+  "reliability": {"status": "unknown", "error_kind": null, "retry_count": null, "rate_limited": null, "agent_failure": null, "reassessment_count": null, "rework_count": null},
   "outcome": {"kind": null, "status": null, "correlation_id": null, "correlation_basis": null, "evidence_source": null},
   "provenance": {"fields": {}, "adapter": "unknown", "semantic_conventions": "gen_ai.experimental", "content_capture": "disabled"},
   "attributes": {},
@@ -113,11 +117,11 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 - Produces `NormalizedEvent.to_mapping() -> dict[str, Any]` and `NormalizedEvent.to_json() -> str`.
 - Produces `canonical_json(value: Any) -> str` and `stable_event_id(value: Mapping[str, Any]) -> str`.
 
-- [ ] Write tests for required keys, UTC timestamps, deterministic IDs, unknown extension retention, and rejection of missing event IDs/timestamps.
-- [ ] Run `python -m unittest tests.test_contracts -v`; expected initial failures identify missing package symbols.
-- [ ] Implement immutable dataclass-backed contracts with explicit normalization of nullable sections and no provider-specific branches.
-- [ ] Run the focused test again; expected result is all contract tests passing.
-- [ ] Run `python -m compileall src tests`; expected result is no syntax errors.
+- [x] Write tests for required keys, UTC timestamps, deterministic IDs, unknown extension retention, and rejection of missing event IDs/timestamps.
+- [x] Run `python -m unittest tests.test_contracts -v`; the current focused run passed 17 tests.
+- [x] Implement immutable dataclass-backed contracts with explicit normalization of nullable sections and no provider-specific branches.
+- [x] Run the focused test again; the current focused run passed 17 tests.
+- [x] Run `python -m compileall src tests`; the current run completed without syntax errors.
 
 ### Task 2: Privacy policy and metadata-first redaction
 
@@ -128,15 +132,15 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 - Create: `docs/privacy.md`
 
 **Interfaces:**
-- Produces `PrivacyPolicy(content_capture: bool = False, hash_sensitive_values: bool = True, max_string_length: int = 512)`.
+- Produces `PrivacyPolicy(content_capture: bool = False, hash_sensitive_values: bool = False, max_string_length: int = 512)`. The non-reversible redaction marker is the secure default; hashing is an explicit correlation opt-in.
 - Produces `redact_mapping(value: Mapping[str, Any], policy: PrivacyPolicy) -> dict[str, Any]`.
 - Produces `redact_event(event: NormalizedEvent, policy: PrivacyPolicy) -> NormalizedEvent`.
 
-- [ ] Add failing tests proving `prompt`, `completion`, `content`, `tool.arguments`, `tool.result`, authorization headers, and keys containing `token`/`secret` are not persisted under default policy.
-- [ ] Add a test proving opt-in content capture is bounded and records `provenance.content_capture = "enabled"`.
-- [ ] Implement deny-by-key redaction before store serialization; replace sensitive scalar values with stable non-reversible hashes only when the policy allows correlation.
-- [ ] Document defaults, opt-in behavior, deletion expectations, and the explicit boundary that redaction cannot recover secrets already emitted by a client outside this process.
-- [ ] Run `python -m unittest tests.test_privacy -v`; expected result is all tests passing.
+- [x] Add tests proving `prompt`, `completion`, `content`, `tool.arguments`, `tool.result`, authorization headers, and keys containing `token`/`secret` are not persisted under default policy.
+- [x] Add a test proving opt-in content capture is bounded and records `provenance.content_capture = "enabled"`.
+- [x] Implement deny-by-key redaction before store serialization; replace sensitive scalar values with stable non-reversible hashes only when the policy allows correlation.
+- [x] Document defaults, opt-in behavior, deletion expectations, and the explicit boundary that redaction cannot recover secrets already emitted by a client outside this process.
+- [x] Run `python -m unittest tests.test_privacy -v`; the current focused run passed 7 tests.
 
 ### Task 3: External Git project resolution
 
@@ -144,17 +148,17 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 - Create: `src/observatory/project.py`
 - Modify: `src/observatory/contracts.py`
 - Test: `tests/test_project.py`
-- Create: `tests/fixtures/non_repo/README.md`
+- Test fixture: temporary repository and non-repository paths in `tests/test_project.py`
 
 **Interfaces:**
 - Produces `resolve_project(path: str | Path, *, git_timeout_seconds: float = 2.0) -> ProjectIdentity`.
 - Produces `ProjectIdentity.to_mapping() -> dict[str, Any]`.
 
-- [ ] Add tests using a temporary Git repository for root, remote, branch, commit, and worktree-safe identity extraction.
-- [ ] Add tests for a non-repository path and a repository with no commit; expected result is an explicit unresolved or partial identity, never an exception from the intake path.
-- [ ] Implement subprocess calls with argument arrays, timeouts, and sanitized absolute paths; derive a stable unresolved ID from the canonical path.
-- [ ] Add an invariant test that no generated file is placed inside the resolved repository root.
-- [ ] Run `python -m unittest tests.test_project -v`; expected result is all tests passing.
+- [x] Add tests using a temporary Git repository for root, remote, branch, commit, and worktree-safe identity extraction.
+- [x] Add tests for a non-repository path and a repository with no commit; the result is an explicit unresolved or partial identity, never an exception from the intake path.
+- [x] Implement subprocess calls with argument arrays, timeouts, and sanitized absolute paths; derive a stable unresolved ID from the canonical path.
+- [x] Add an invariant test that no generated file is placed inside the resolved repository root.
+- [x] Run `python -m unittest tests.test_project -v`; the current focused run passed 3 tests.
 
 ### Task 4: Durable idempotent store and query surface
 
@@ -169,10 +173,10 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 - `AppendResult` distinguishes `inserted`, `duplicate`, and `rejected` without throwing for duplicate events.
 - Query filters are allow-listed dimensions: time range, project, provider, model, client, event type, status, and evidence source.
 
-- [ ] Add tests for schema creation, WAL mode, unique event IDs, duplicate replay, late events, unknown fields, query filters, and atomic failure on malformed records.
-- [ ] Implement a versioned migration runner and one transaction per append; store canonical JSON plus indexed dimensions so the schema can evolve without losing extensions.
-- [ ] Implement summary counters for events, successful/failed operations, input/output tokens by provenance, and distinct projects/models.
-- [ ] Run `python -m unittest tests.test_store -v`; expected result is all tests passing.
+- [x] Add tests for schema creation, WAL mode, unique event IDs, duplicate replay, late events, unknown fields, query filters, and atomic failure on malformed records.
+- [x] Implement a versioned migration runner and one transaction per append; store canonical JSON plus indexed dimensions so the schema can evolve without losing extensions.
+- [x] Implement summary counters for events, successful/failed operations, input/output tokens by provenance, and distinct projects/models.
+- [x] Run `python -m unittest tests.test_store -v`; the current focused run passed 18 tests.
 
 ### Task 5: Host intake API and offline-safe CLI ingestion
 
@@ -192,12 +196,12 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 - Produces OTLP/JSON-compatible `POST /v1/traces`, `/v1/metrics`, and `/v1/logs` normalization endpoints; the Collector supplies batching/retry and the API supplies redaction/idempotent storage.
 - CLI commands are `install`, `doctor`, `start`, `stop`, `status`, `configure`, `open`, `update`, `ingest`, `resolve-project`, and `run-api`.
 
-- [ ] Add tests for bounded request size, malformed JSON, redaction-before-persistence, duplicate responses, health readiness, and metrics output.
-- [ ] Add a CLI test proving `ingest --offline` writes only to the configured user data directory and continues successfully when the API is unavailable.
-- [ ] Implement the API with the standard-library HTTP server so the core can run before optional dependencies are installed; bind to loopback by default.
-- [ ] Implement the OTLP JSON bridge for resource spans, logs, and metrics while preserving trace/span IDs, schema URLs, source identity, usage provenance, and metadata-only attributes.
-- [ ] Implement `ingest` as asynchronous-tolerant: HTTP delivery is best effort, while offline JSONL spooling is the durable fallback and never invokes provider inference.
-- [ ] Run `python -m unittest tests.test_api tests.test_cli -v`; expected result is all tests passing.
+- [x] Add tests for bounded request size, malformed JSON, redaction-before-persistence, duplicate responses, health readiness, and metrics output.
+- [x] Add a CLI test proving `ingest --offline` writes only to the configured user data directory and continues successfully when the API is unavailable.
+- [x] Implement the API with the standard-library HTTP server so the core can run before optional dependencies are installed; bind to loopback by default.
+- [x] Implement the OTLP JSON bridge for resource spans, logs, and metrics while preserving trace/span IDs, schema URLs, source identity, usage provenance, and metadata-only attributes.
+- [x] Implement `ingest` as asynchronous-tolerant: HTTP delivery is best effort, while offline JSONL spooling is the durable fallback and never invokes provider inference.
+- [x] Run `python -m unittest tests.test_api tests.test_cli -v`; the current focused run passed 41 tests.
 
 ### Task 6: OTel Collector, Tempo, Prometheus, Grafana, and Compose deployment
 
@@ -218,12 +222,12 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 - Collector exports JSON OTLP signals to the host normalizer as a bounded, queued secondary path while retaining Tempo/Loki/Prometheus fan-out.
 - Grafana provisions Prometheus and Tempo data sources and loads a global dashboard with evidence-quality labels.
 
-- [ ] Add static tests for loopback port bindings, no provider credentials in Compose/config/dashboard files, default content capture disabled, healthchecks, persistent volumes, and OTel processor ordering.
-- [ ] Implement the Compose stack with pinned image tags supplied by the current capability evidence; use `restart: unless-stopped` and named volumes for stateful services.
-- [ ] Implement the dashboard with all-project defaults and variables for project, provider, model, client, route, agent role, workflow, branch, and status.
-- [ ] Add a verification script that parses JSON and YAML-like required keys without requiring a running Docker daemon.
-- [ ] Run `python -m unittest tests.test_deployment -v`; expected result is all static deployment tests passing.
-- [ ] If Docker is available, run `docker compose config`; expected result is a normalized Compose configuration with no errors. Record runtime startup separately.
+- [x] Add static tests for loopback port bindings, no provider credentials in Compose/config/dashboard files, default content capture disabled, healthchecks, persistent volumes, and OTel processor ordering.
+- [x] Implement the Compose stack with digest-pinned image references; use `restart: unless-stopped` and named volumes for stateful services.
+- [x] Implement the dashboard family with all-project defaults and variables for project, provider, model, client, route, agent role, workflow, branch, and status.
+- [x] Add a verification script that parses JSON and YAML-like required keys without requiring a running Docker daemon.
+- [x] Run `python -m unittest tests.test_deployment -v`; the current focused run passed 16 tests.
+- [x] The disposable runtime gate validated Compose normalization, startup, readiness, recovery, and dashboard provisioning; runtime startup remains separately recorded from static validation.
 
 ### Task 7: Capability registry and adapter seams
 
@@ -239,10 +243,10 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 - Produces `ObservationAdapter.iter_events() -> Iterator[Mapping[str, Any]]` and `AdapterRegistry.get(name: str)`.
 - The generic JSONL adapter is supported; unverified native adapters are represented as partial/unknown records rather than faked.
 
-- [ ] Add adapter contract tests for bounded lines, malformed record isolation, unknown fields, source metadata, and deterministic event IDs.
-- [ ] Implement the generic adapter and registry without importing provider SDKs into the core package.
-- [ ] Populate the capability matrix only from first-party or local evidence, with unsupported/unknown fields explicit.
-- [ ] Run `python -m unittest tests.test_adapters -v`; expected result is all tests passing.
+- [x] Add adapter contract tests for bounded lines, malformed record isolation, unknown fields, source metadata, and deterministic event IDs.
+- [x] Implement the generic adapter and registry without importing provider SDKs into the core package.
+- [x] Populate the capability matrix only from first-party or local evidence, with unsupported/unknown fields explicit.
+- [x] Run `python -m unittest tests.test_adapters -v`; the current focused run passed 17 tests.
 
 ### Task 8: Failure-isolation and operational validation
 
@@ -253,11 +257,11 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 - Create: `docs/operations.md`
 - Modify: `README.md`
 
-- [ ] Add tests proving API/storage/Collector endpoint failure affects only telemetry delivery or local spool state, not any inference function or provider request path in this repository.
-- [ ] Add tests proving malformed telemetry, duplicate events, saturated offline spool limits, unknown provider/model/repository, and restart-safe migrations have explicit outcomes.
-- [ ] Document the distinction between `inference healthy` and `telemetry degraded`, installation, diagnostics, retention, backup, deletion, and recovery.
-- [ ] Run `python scripts/verify.py`; expected result is a nonzero exit for missing required contracts and zero for the complete local tree.
-- [ ] Run the full suite with `python -m unittest discover -s tests -v`; expected result is zero failures.
+- [x] Add tests proving API/storage/Collector endpoint failure affects only telemetry delivery or local spool state, not any inference function or provider request path in this repository.
+- [x] Add tests proving malformed telemetry, duplicate events, saturated offline spool limits, unknown provider/model/repository, and restart-safe migrations have explicit outcomes.
+- [x] Document the distinction between `inference healthy` and `telemetry degraded`, installation, diagnostics, retention, backup, deletion, and recovery.
+- [x] Run `python scripts/verify.py`; the current verifier returns zero failures.
+- [x] Run the full suite with `python -m unittest discover -s tests -v`; the current full-suite evidence is 187 passing tests.
 
 ## Parallel Execution Strategy
 
@@ -300,14 +304,14 @@ The reconnaissance lanes are read-only and independent: provider capabilities, O
 - The README states what is implemented, what is supported but not locally verified, what remains partial/unknown, and how to recover from Observatory failure.
 - Final reporting distinguishes implemented code, locally machine-verified behavior, static deployment validation, runtime container proof, and provider/client evidence.
 
+The definition above describes the code and validation plan, not unconditional production sign-off. The current release ledger keeps the post-fix real-client run, stable-state host reboot, human dashboard visual sweep, off-host encrypted recovery, and signed image promotion as explicit external gates.
+
 ## Execution brief
 
-- **First work:** finish the current read-only capability reports and implement Tasks 1–3.
-- **Highest-leverage dependency:** the versioned `NormalizedEvent` plus privacy/provenance contract.
-- **Immediately available lanes:** store/query, deployment, and adapter registry after contract names are locked.
-- **Blocked lanes:** provider-specific configuration until first-party capability evidence is recorded; runtime Compose proof until Docker daemon access is confirmed.
-- **Integration owner:** the main implementation thread owns cross-boundary schema and deployment integration.
-- **Verification owner:** the main implementation thread runs the full suite and independent failure checks.
-- **Highest-risk assumption:** a single-host SQLite canonical store is sufficient for the first private deployment; its repository interface must make later migration explicit and lossless.
-- **Likely failure mode:** a locally valid adapter or dashboard silently treats estimated or client-reported usage as provider-authoritative; provenance tests prevent this.
-- **Evidence required before completion:** focused/full test output, privacy scan, Compose config validation, capability evidence with confidence labels, and separate runtime/visual proof where available.
+- **Implementation state:** Tasks 1–8 are implemented and their focused checks are green in the current working tree.
+- **Highest-leverage dependency:** the versioned `NormalizedEvent` plus privacy/provenance contract remains the compatibility boundary for future clients and backends.
+- **Integration owner:** the main implementation thread owns cross-boundary schema and deployment integration; the connected-impact metric-context repair is independently verified.
+- **Verification owner:** the main implementation thread ran the full suite, static verifier, disposable runtime gate, dedicated queue-saturation gate, and fresh read-only independent seam review.
+- **Highest-risk assumption:** a single-host SQLite canonical store is sufficient for the first private deployment; its repository interface makes later migration explicit and lossless.
+- **Likely failure mode:** a locally valid adapter or dashboard silently treats estimated or client-reported usage as provider-authoritative; provenance tests and dashboard evidence labels prevent this.
+- **Remaining release evidence:** one fresh user-authorized real-client acceptance run after the Claude plain-key mapping fix, a stable-state host reboot, human visual review, off-host encrypted restore, and organization-specific signed-image promotion.

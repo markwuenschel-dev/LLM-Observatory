@@ -1,5 +1,55 @@
 version: 1
-last_verified: 2026-08-07
+last_verified: 2026-08-08
+capability_contract:
+  version: 1
+  omitted_field_default: UNKNOWN
+  metadata_fields:
+    - auth_modes
+  fields:
+    - native_otel
+    - signals
+    - hooks_or_events
+    - subscription_telemetry
+    - authoritative_token_counts
+    - model_identity
+    - tool_calls
+    - session_identity
+    - agent_identity
+    - request_latency
+    - errors_retries
+    - global_configuration
+    - zero_repository_contamination
+    - inference_proxy
+local_client_probes:
+  - client: claude-code
+    installed: true
+    observed_version: "2.1.226 (Claude Code)"
+    version_probe_status: VERIFIED_LOCALLY
+  - client: codex
+    installed: true
+    observed_version: null
+    version_probe_status: BLOCKED_BY_HOST_POLICY
+  - client: gemini-cli
+    installed: false
+    observed_version: null
+    version_probe_status: NOT_INSTALLED
+  - client: cursor
+    installed: true
+    observed_version: "3.14.27"
+    version_probe_status: VERIFIED_LOCALLY
+  - client: kimi
+    installed: true
+    observed_version: "0.28.1"
+    version_probe_status: VERIFIED_LOCALLY
+  - client: grok
+    installed: true
+    observed_version: "0.2.118"
+    version_probe_status: VERIFIED_LOCALLY
+probe_status_values:
+  - VERIFIED_LOCALLY
+  - INSTALLED_NOT_VERIFIED
+  - BLOCKED_BY_HOST_POLICY
+  - NOT_INSTALLED
 confidence_values:
   - VERIFIED_LOCALLY
   - VERIFIED_FIRST_PARTY
@@ -11,10 +61,12 @@ confidence_values:
 clients:
   - provider: anthropic
     client: claude-code
-    installed_version: 2.1.224
+    installed_version: 2.1.226
     confidence: PARTIAL
+    auth_modes: subscription,api,bedrock,vertex
     capabilities:
       native_otel: PARTIAL
+      signals: metrics,logs,traces-beta
       hooks_or_events: VERIFIED_FIRST_PARTY
       subscription_telemetry: VERIFIED_FIRST_PARTY
       authoritative_token_counts: VERIFIED_FIRST_PARTY
@@ -24,14 +76,21 @@ clients:
       agent_identity: PARTIAL
       global_configuration: VERIFIED_FIRST_PARTY
       zero_repository_contamination: PARTIAL
+      request_latency: VERIFIED_FIRST_PARTY
+      errors_retries: VERIFIED_FIRST_PARTY
+      inference_proxy: MUST_NOT_BE_USED
     evidence:
-      - "Local executable version verified; telemetry capability requires current first-party verification."
+      - "https://code.claude.com/docs/en/monitoring-usage"
+      - "https://code.claude.com/docs/en/agent-sdk/observability"
+      - "Local Claude Code 2.1.226 --help exposed --include-hook-events and stream-json; native export remains classified PARTIAL."
   - provider: openai
     client: codex
     installed_version: UNKNOWN
     confidence: SUPPORTED_NOT_LOCALLY_VERIFIED
+    auth_modes: subscription,api
     capabilities:
       native_otel: VERIFIED_FIRST_PARTY
+      signals: logs,metrics,traces
       hooks_or_events: VERIFIED_FIRST_PARTY
       subscription_telemetry: VERIFIED_FIRST_PARTY
       authoritative_token_counts: PARTIAL
@@ -41,14 +100,21 @@ clients:
       agent_identity: PARTIAL
       global_configuration: VERIFIED_FIRST_PARTY
       zero_repository_contamination: PARTIAL
+      request_latency: VERIFIED_FIRST_PARTY
+      errors_retries: VERIFIED_FIRST_PARTY
+      inference_proxy: MUST_NOT_BE_USED
     evidence:
+      - "https://github.com/openai/codex/blob/main/codex-rs/core/config.schema.json"
+      - "https://developers.openai.com/codex/agent-approvals-security#monitoring-and-telemetry"
       - "Codex executable is discoverable locally, but version execution is blocked by the current Windows access policy."
   - provider: google
     client: gemini-cli
     installed_version: NOT_INSTALLED
     confidence: SUPPORTED_NOT_LOCALLY_VERIFIED
+    auth_modes: subscription,api,vertex
     capabilities:
       native_otel: VERIFIED_FIRST_PARTY
+      signals: logs,metrics,traces
       hooks_or_events: VERIFIED_FIRST_PARTY
       subscription_telemetry: PARTIAL
       authoritative_token_counts: PARTIAL
@@ -58,14 +124,19 @@ clients:
       agent_identity: VERIFIED_FIRST_PARTY
       global_configuration: VERIFIED_FIRST_PARTY
       zero_repository_contamination: PARTIAL
+      request_latency: VERIFIED_FIRST_PARTY
+      errors_retries: VERIFIED_FIRST_PARTY
+      inference_proxy: MUST_NOT_BE_USED
     evidence:
       - "Local executable discovery returned NOT_FOUND; no support claim is made."
   - provider: cursor
     client: cursor
     installed_version: 3.14.27
     confidence: PARTIAL
+    auth_modes: subscription,api
     capabilities:
       native_otel: UNKNOWN
+      signals: structured-output/events
       hooks_or_events: VERIFIED_FIRST_PARTY
       subscription_telemetry: VERIFIED_FIRST_PARTY
       authoritative_token_counts: PARTIAL
@@ -75,14 +146,21 @@ clients:
       agent_identity: UNKNOWN
       global_configuration: VERIFIED_FIRST_PARTY
       zero_repository_contamination: PARTIAL
+      request_latency: PARTIAL
+      errors_retries: PARTIAL
+      inference_proxy: MUST_NOT_BE_USED
     evidence:
-      - "Local executable version verified; telemetry capability requires current first-party verification."
+      - "https://docs.cursor.com/en/cli/reference/output-format"
+      - "https://docs.cursor.com/en/cli/overview"
+      - "Local Cursor 3.14.27 --help/version verified; structured stream events are supported, native OTel is UNKNOWN."
   - provider: moonshot
     client: kimi
     installed_version: 0.28.1
     confidence: PARTIAL
+    auth_modes: subscription,api
     capabilities:
       native_otel: UNKNOWN
+      signals: stream-json/hooks
       hooks_or_events: VERIFIED_FIRST_PARTY
       subscription_telemetry: VERIFIED_FIRST_PARTY
       authoritative_token_counts: PARTIAL
@@ -92,14 +170,21 @@ clients:
       agent_identity: VERIFIED_FIRST_PARTY
       global_configuration: VERIFIED_FIRST_PARTY
       zero_repository_contamination: PARTIAL
+      request_latency: PARTIAL
+      errors_retries: PARTIAL
+      inference_proxy: MUST_NOT_BE_USED
     evidence:
-      - "Local executable version verified; telemetry capability requires current first-party verification."
+      - "https://moonshotai.github.io/kimi-code/en/reference/kimi-command"
+      - "https://moonshotai.github.io/kimi-code/en/customization/hooks"
+      - "Local Kimi 0.28.1 --help/version verified; stream-json and hooks are supported, native OTel is UNKNOWN."
   - provider: xai
     client: grok
     installed_version: 0.2.118
     confidence: PARTIAL
+    auth_modes: api
     capabilities:
       native_otel: UNKNOWN
+      signals: structured-output/sessions
       hooks_or_events: VERIFIED_FIRST_PARTY
       subscription_telemetry: PARTIAL
       authoritative_token_counts: PARTIAL
@@ -109,14 +194,21 @@ clients:
       agent_identity: PARTIAL
       global_configuration: PARTIAL
       zero_repository_contamination: PARTIAL
+      request_latency: PARTIAL
+      errors_retries: PARTIAL
+      inference_proxy: MUST_NOT_BE_USED
     evidence:
-      - "Grok executable/version 0.2.118 was observed locally by the capability research lane; native OTel remains unknown."
+      - "https://docs.x.ai/build/features/skills-plugins-marketplaces"
+      - "https://docs.x.ai/build/cli/reference"
+      - "Local Grok 0.2.118 --help/version verified; hooks, sessions, and trace-related CLI surfaces are present, native OTel is UNKNOWN."
   - provider: openrouter
     client: openrouter-api
     installed_version: NOT_INSTALLED
     confidence: SUPPORTED_NOT_LOCALLY_VERIFIED
+    auth_modes: api
     capabilities:
       native_otel: SUPPORTED_NOT_LOCALLY_VERIFIED
+      signals: gateway-response/optional-otel
       hooks_or_events: SUPPORTED_NOT_LOCALLY_VERIFIED
       subscription_telemetry: UNSUPPORTED
       authoritative_token_counts: VERIFIED_FIRST_PARTY
@@ -126,14 +218,19 @@ clients:
       agent_identity: PARTIAL
       global_configuration: SUPPORTED_NOT_LOCALLY_VERIFIED
       zero_repository_contamination: SUPPORTED_NOT_LOCALLY_VERIFIED
+      request_latency: VERIFIED_FIRST_PARTY
+      errors_retries: VERIFIED_FIRST_PARTY
+      inference_proxy: MUST_NOT_BE_USED
     evidence:
       - "No local OpenRouter CLI was found; OpenRouter is represented as a route/gateway dimension, not a mandatory inference proxy."
   - provider: unknown
     client: jsonl
     installed_version: local
     confidence: VERIFIED_LOCALLY
+    auth_modes: unknown
     capabilities:
       native_otel: UNSUPPORTED
+      signals: jsonl
       hooks_or_events: SUPPORTED
       subscription_telemetry: UNKNOWN
       authoritative_token_counts: UNKNOWN
@@ -143,6 +240,9 @@ clients:
       agent_identity: SUPPORTED_IF_REPORTED
       global_configuration: SUPPORTED
       zero_repository_contamination: SUPPORTED
+      request_latency: SUPPORTED_IF_REPORTED
+      errors_retries: SUPPORTED_IF_REPORTED
+      inference_proxy: MUST_NOT_BE_USED
     evidence:
       - "Implemented bounded JSONL adapter and contract tests in this repository."
 
@@ -150,8 +250,10 @@ clients:
     client: direct-anthropic-api
     installed_version: NOT_INSTALLED
     confidence: SUPPORTED_NOT_LOCALLY_VERIFIED
+    auth_modes: api
     capabilities:
       native_otel: UNKNOWN
+      signals: response-envelope
       hooks_or_events: PARTIAL
       subscription_telemetry: UNSUPPORTED
       authoritative_token_counts: VERIFIED_FIRST_PARTY
@@ -161,6 +263,9 @@ clients:
       agent_identity: UNKNOWN
       global_configuration: SUPPORTED_NOT_LOCALLY_VERIFIED
       zero_repository_contamination: SUPPORTED_NOT_LOCALLY_VERIFIED
+      request_latency: SUPPORTED_IF_REPORTED
+      errors_retries: SUPPORTED_IF_REPORTED
+      inference_proxy: MUST_NOT_BE_USED
     evidence:
       - "Direct Messages API response usage, model, request IDs, and tool blocks are first-party documented; caller owns retries and session semantics."
 
@@ -168,8 +273,10 @@ clients:
     client: direct-openai-api
     installed_version: NOT_INSTALLED
     confidence: SUPPORTED_NOT_LOCALLY_VERIFIED
+    auth_modes: api
     capabilities:
       native_otel: UNKNOWN
+      signals: response-envelope
       hooks_or_events: PARTIAL
       subscription_telemetry: UNSUPPORTED
       authoritative_token_counts: VERIFIED_FIRST_PARTY
@@ -179,6 +286,9 @@ clients:
       agent_identity: PARTIAL
       global_configuration: SUPPORTED_NOT_LOCALLY_VERIFIED
       zero_repository_contamination: SUPPORTED_NOT_LOCALLY_VERIFIED
+      request_latency: SUPPORTED_IF_REPORTED
+      errors_retries: SUPPORTED_IF_REPORTED
+      inference_proxy: MUST_NOT_BE_USED
     evidence:
       - "Responses API and Agents SDK tracing material are first-party documented; external export requires a caller-owned bridge."
 
@@ -186,8 +296,10 @@ clients:
     client: direct-google-api
     installed_version: NOT_INSTALLED
     confidence: SUPPORTED_NOT_LOCALLY_VERIFIED
+    auth_modes: api,vertex
     capabilities:
       native_otel: UNKNOWN
+      signals: response-envelope
       hooks_or_events: PARTIAL
       subscription_telemetry: UNSUPPORTED
       authoritative_token_counts: VERIFIED_FIRST_PARTY
@@ -197,15 +309,20 @@ clients:
       agent_identity: UNKNOWN
       global_configuration: SUPPORTED_NOT_LOCALLY_VERIFIED
       zero_repository_contamination: SUPPORTED_NOT_LOCALLY_VERIFIED
+      request_latency: SUPPORTED_IF_REPORTED
+      errors_retries: SUPPORTED_IF_REPORTED
+      inference_proxy: MUST_NOT_BE_USED
     evidence:
       - "GenerateContent and Interactions APIs document model, response, usageMetadata, and tool fields; caller owns latency/retry semantics."
 
   - provider: xai
-    client: direct-xai-sdk
+    client: direct-xai-api
     installed_version: NOT_INSTALLED
     confidence: SUPPORTED_NOT_LOCALLY_VERIFIED
+    auth_modes: api
     capabilities:
       native_otel: SUPPORTED_NOT_LOCALLY_VERIFIED
+      signals: response-envelope
       hooks_or_events: PARTIAL
       subscription_telemetry: UNSUPPORTED
       authoritative_token_counts: VERIFIED_FIRST_PARTY
@@ -215,5 +332,8 @@ clients:
       agent_identity: PARTIAL
       global_configuration: SUPPORTED_NOT_LOCALLY_VERIFIED
       zero_repository_contamination: SUPPORTED_NOT_LOCALLY_VERIFIED
+      request_latency: SUPPORTED_IF_REPORTED
+      errors_retries: SUPPORTED_IF_REPORTED
+      inference_proxy: MUST_NOT_BE_USED
     evidence:
       - "Official xAI SDK documents optional console/OTLP exporters, usage, tools, timing, and exact cost ticks; local integration remains unverified."

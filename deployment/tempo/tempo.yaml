@@ -1,8 +1,10 @@
 stream_over_http_enabled: true
 
+usage_report:
+  reporting_enabled: false
+
 server:
   http_listen_port: 3200
-  grpc_listen_port: 9095
 
 distributor:
   receivers:
@@ -13,10 +15,7 @@ distributor:
         http:
           endpoint: 0.0.0.0:4318
 
-ingester:
-  max_block_duration: 5m
-
-compactor:
+backend_worker:
   compaction:
     block_retention: ${TEMPO_RETENTION:-720h}
 

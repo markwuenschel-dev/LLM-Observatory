@@ -8,19 +8,57 @@ rewrites an inference endpoint or adds a repository-local file.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import subprocess
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from .adapters.base import CapabilityRecord
 
 
 LOCAL_OTLP_GRPC = "http://127.0.0.1:4317"
 LOCAL_OTLP_HTTP = "http://127.0.0.1:4318"
+CAPABILITY_CONTRACT_VERSION = "1"
+CANONICAL_CAPABILITY_FIELDS = (
+    "native_otel",
+    "signals",
+    "hooks_or_events",
+    "subscription_telemetry",
+    "authoritative_token_counts",
+    "model_identity",
+    "tool_calls",
+    "session_identity",
+    "agent_identity",
+    "request_latency",
+    "errors_retries",
+    "global_configuration",
+    "zero_repository_contamination",
+    "inference_proxy",
+)
+
+
+def _canonical_capabilities(values: Mapping[str, str]) -> dict[str, str]:
+    """Expose one stable vocabulary while retaining provider-specific extras."""
+
+    aliases = {
+        "authoritative_token_counts": ("authoritative_token_counts", "authoritative_usage"),
+        "session_identity": ("session_identity", "session_and_agent_identity", "session_and_tool_identity"),
+        "agent_identity": ("agent_identity", "session_and_agent_identity", "session_and_tool_identity"),
+        "zero_repository_contamination": ("zero_repository_contamination",),
+    }
+    result = dict(values)
+    for field_name in CANONICAL_CAPABILITY_FIELDS:
+        if field_name in result:
+            continue
+        result[field_name] = next((str(values[name]) for name in aliases.get(field_name, (field_name,)) if name in values), "UNKNOWN")
+    return result
 
 
 @dataclass(frozen=True)
@@ -35,12 +73,12 @@ class ClientSpec:
     config_path_hint: str | None = None
     native_config: bool = False
 
-    def capabilities_record(self, *, installed: bool | None = None) -> CapabilityRecord:
-        capabilities = dict(self.capabilities)
+    def capabilities_record(self, *, installed: bool | None = None, version_probe_status: str | None = None) -> CapabilityRecord:
+        capabilities = _canonical_capabilities(self.capabilities)
         if installed is False:
             capabilities["installed"] = "NOT_INSTALLED"
         elif installed is True:
-            capabilities["installed"] = "VERIFIED_LOCALLY"
+            capabilities["installed"] = "VERIFIED_LOCALLY" if version_probe_status in (None, "verified") else "INSTALLED_NOT_VERIFIED"
         return CapabilityRecord(
             provider=self.provider,
             client=self.name,
@@ -48,12 +86,17 @@ class ClientSpec:
             capabilities=capabilities,
             auth_modes=self.auth_modes,
             evidence=self.evidence,
-            last_verified="2026-08-07",
+            last_verified=datetime.now(timezone.utc).date().isoformat(),
+            contract_version=CAPABILITY_CONTRACT_VERSION,
         )
 
 
 _COMMON = {
-    "zero_repository_contamination": "SUPPORTED",
+    # The baseline is repository-external, but not every client can be
+    # configured globally without project-local hooks or rules.  Keep the
+    # executable catalog conservative; provider-specific rows may strengthen
+    # this only when their evidence supports it.
+    "zero_repository_contamination": "PARTIAL",
     "inference_proxy": "MUST_NOT_BE_USED",
     "metadata_only_default": "SUPPORTED",
 }
@@ -66,11 +109,13 @@ CLIENT_SPECS: dict[str, ClientSpec] = {
         confidence="PARTIAL",
         capabilities={
             **_COMMON,
-            "native_otel": "SUPPORTED",
+            "native_otel": "PARTIAL",
             "signals": "metrics,logs,traces-beta",
+            "hooks_or_events": "SUPPORTED",
             "subscription_telemetry": "SUPPORTED",
             "authoritative_usage": "SUPPORTED",
             "session_and_tool_identity": "SUPPORTED",
+            "agent_identity": "PARTIAL",
             "global_configuration": "SUPPORTED",
         },
         auth_modes=("subscription", "api", "bedrock", "vertex"),
@@ -90,13 +135,17 @@ CLIENT_SPECS: dict[str, ClientSpec] = {
             **_COMMON,
             "native_otel": "SUPPORTED",
             "signals": "logs,metrics,traces",
+            "hooks_or_events": "SUPPORTED",
             "subscription_telemetry": "SUPPORTED",
             "authoritative_usage": "PARTIAL",
             "session_and_agent_identity": "PARTIAL",
             "global_configuration": "SUPPORTED",
         },
         auth_modes=("subscription", "api"),
-        evidence=("https://learn.chatgpt.com/docs/config-file/config-reference#configtoml",),
+        evidence=(
+            "https://github.com/openai/codex/blob/main/codex-rs/core/config.schema.json",
+            "https://developers.openai.com/codex/agent-approvals-security#monitoring-and-telemetry",
+        ),
         config_kind="codex-toml",
         config_path_hint="~/.codex/config.toml",
         native_config=True,
@@ -109,8 +158,9 @@ CLIENT_SPECS: dict[str, ClientSpec] = {
             **_COMMON,
             "native_otel": "SUPPORTED",
             "signals": "logs,metrics,traces",
+            "hooks_or_events": "SUPPORTED",
             "subscription_telemetry": "PARTIAL",
-            "authoritative_usage": "SUPPORTED",
+            "authoritative_usage": "PARTIAL",
             "session_and_agent_identity": "SUPPORTED",
             "global_configuration": "SUPPORTED",
         },
@@ -130,13 +180,18 @@ CLIENT_SPECS: dict[str, ClientSpec] = {
         capabilities={
             **_COMMON,
             "native_otel": "UNKNOWN",
-            "signals": "structured-output/hooks",
+            "signals": "structured-output/events",
+            "hooks_or_events": "SUPPORTED",
             "authoritative_usage": "PARTIAL",
             "model_identity": "SUPPORTED",
             "global_configuration": "PARTIAL",
         },
         auth_modes=("subscription", "api"),
-        evidence=("Local installation was detected; native OTel configuration was not verified.",),
+        evidence=(
+            "https://docs.cursor.com/en/cli/reference/output-format",
+            "https://docs.cursor.com/en/cli/overview",
+            "Local installation was detected; structured stream events are supported but native OTel configuration was not verified.",
+        ),
         config_kind="discovery-only",
         native_config=False,
     ),
@@ -148,12 +203,17 @@ CLIENT_SPECS: dict[str, ClientSpec] = {
             **_COMMON,
             "native_otel": "UNKNOWN",
             "signals": "stream-json/hooks",
+            "hooks_or_events": "SUPPORTED",
             "authoritative_usage": "PARTIAL",
             "model_identity": "SUPPORTED",
             "global_configuration": "PARTIAL",
         },
         auth_modes=("subscription", "api"),
-        evidence=("Local installation was detected; native OTel configuration was not verified.",),
+        evidence=(
+            "https://moonshotai.github.io/kimi-code/en/reference/kimi-command",
+            "https://moonshotai.github.io/kimi-code/en/customization/hooks",
+            "Local installation was detected; stream-json and hooks are supported but native OTel configuration was not verified.",
+        ),
         config_kind="discovery-only",
         native_config=False,
     ),
@@ -165,13 +225,43 @@ CLIENT_SPECS: dict[str, ClientSpec] = {
             **_COMMON,
             "native_otel": "UNKNOWN",
             "signals": "structured-output/sessions",
+            "hooks_or_events": "SUPPORTED",
             "authoritative_usage": "PARTIAL",
             "model_identity": "SUPPORTED",
             "global_configuration": "PARTIAL",
         },
         auth_modes=("api",),
-        evidence=("Local capability research observed structured output; native OTel was not verified.",),
+        evidence=(
+            "https://docs.x.ai/build/features/skills-plugins-marketplaces",
+            "https://docs.x.ai/build/cli/reference",
+            "Local capability research observed structured output, hooks, and session surfaces; native OTel was not verified.",
+        ),
         config_kind="discovery-only",
+        native_config=False,
+    ),
+    "jsonl": ClientSpec(
+        name="jsonl",
+        provider="unknown",
+        confidence="VERIFIED_LOCALLY",
+        capabilities={
+            "native_otel": "UNSUPPORTED",
+            "signals": "jsonl",
+            "hooks_or_events": "SUPPORTED",
+            "subscription_telemetry": "UNKNOWN",
+            "authoritative_token_counts": "UNKNOWN",
+            "model_identity": "SUPPORTED_IF_REPORTED",
+            "tool_calls": "SUPPORTED_IF_REPORTED",
+            "session_identity": "SUPPORTED_IF_REPORTED",
+            "agent_identity": "SUPPORTED_IF_REPORTED",
+            "global_configuration": "SUPPORTED",
+            "zero_repository_contamination": "SUPPORTED",
+            "request_latency": "SUPPORTED_IF_REPORTED",
+            "errors_retries": "SUPPORTED_IF_REPORTED",
+            "inference_proxy": "MUST_NOT_BE_USED",
+        },
+        auth_modes=("unknown",),
+        evidence=("bounded JSONL adapter and contract tests in this repository",),
+        config_kind="adapter-only",
         native_config=False,
     ),
     "openrouter": ClientSpec(
@@ -180,6 +270,7 @@ CLIENT_SPECS: dict[str, ClientSpec] = {
         confidence="SUPPORTED_NOT_LOCALLY_VERIFIED",
         capabilities={
             **_COMMON,
+            "zero_repository_contamination": "SUPPORTED_NOT_LOCALLY_VERIFIED",
             "native_otel": "SUPPORTED_NOT_LOCALLY_VERIFIED",
             "signals": "gateway-response/optional-otel",
             "authoritative_usage": "SUPPORTED",
@@ -195,31 +286,123 @@ CLIENT_SPECS: dict[str, ClientSpec] = {
         name="direct-openai-api",
         provider="openai",
         confidence="SUPPORTED_NOT_LOCALLY_VERIFIED",
-        capabilities={**_COMMON, "native_otel": "CALLER_OWNED", "signals": "response-envelope", "authoritative_usage": "SUPPORTED", "global_configuration": "CALLER_OWNED"},
+        capabilities={**_COMMON, "zero_repository_contamination": "SUPPORTED_NOT_LOCALLY_VERIFIED", "native_otel": "CALLER_OWNED", "signals": "response-envelope", "authoritative_usage": "SUPPORTED", "global_configuration": "CALLER_OWNED"},
         auth_modes=("api",), evidence=("The caller-owned response adapter preserves provider usage without owning inference routing.",), config_kind="adapter-only", native_config=False,
     ),
     "direct-anthropic": ClientSpec(
         name="direct-anthropic-api",
         provider="anthropic",
         confidence="SUPPORTED_NOT_LOCALLY_VERIFIED",
-        capabilities={**_COMMON, "native_otel": "CALLER_OWNED", "signals": "response-envelope", "authoritative_usage": "SUPPORTED", "global_configuration": "CALLER_OWNED"},
+        capabilities={**_COMMON, "zero_repository_contamination": "SUPPORTED_NOT_LOCALLY_VERIFIED", "native_otel": "CALLER_OWNED", "signals": "response-envelope", "authoritative_usage": "SUPPORTED", "global_configuration": "CALLER_OWNED"},
         auth_modes=("api",), evidence=("The caller-owned response adapter preserves provider usage without owning inference routing.",), config_kind="adapter-only", native_config=False,
     ),
     "direct-google": ClientSpec(
         name="direct-google-api",
         provider="google",
         confidence="SUPPORTED_NOT_LOCALLY_VERIFIED",
-        capabilities={**_COMMON, "native_otel": "CALLER_OWNED", "signals": "response-envelope", "authoritative_usage": "SUPPORTED", "global_configuration": "CALLER_OWNED"},
+        capabilities={**_COMMON, "zero_repository_contamination": "SUPPORTED_NOT_LOCALLY_VERIFIED", "native_otel": "CALLER_OWNED", "signals": "response-envelope", "authoritative_usage": "SUPPORTED", "global_configuration": "CALLER_OWNED"},
         auth_modes=("api", "vertex"), evidence=("The caller-owned response adapter preserves provider usage without owning inference routing.",), config_kind="adapter-only", native_config=False,
     ),
     "direct-xai": ClientSpec(
         name="direct-xai-api",
         provider="xai",
         confidence="SUPPORTED_NOT_LOCALLY_VERIFIED",
-        capabilities={**_COMMON, "native_otel": "CALLER_OWNED", "signals": "response-envelope", "authoritative_usage": "SUPPORTED", "global_configuration": "CALLER_OWNED"},
+        capabilities={**_COMMON, "zero_repository_contamination": "SUPPORTED_NOT_LOCALLY_VERIFIED", "native_otel": "CALLER_OWNED", "signals": "response-envelope", "authoritative_usage": "SUPPORTED", "global_configuration": "CALLER_OWNED"},
         auth_modes=("api",), evidence=("The caller-owned response adapter preserves provider usage without owning inference routing.",), config_kind="adapter-only", native_config=False,
     ),
 }
+
+
+# Keep the executable catalog on the same canonical vocabulary as
+# docs/capability-matrix.yaml.  Provider-specific aliases may remain in the
+# declarations above for compatibility, but every capability exposed to the
+# CLI and doctor is normalized through this contract.
+_CAPABILITY_MATRIX_FIELDS: dict[str, dict[str, str]] = {
+    "claude": {
+        "native_otel": "PARTIAL", "signals": "metrics,logs,traces-beta", "hooks_or_events": "VERIFIED_FIRST_PARTY",
+        "subscription_telemetry": "VERIFIED_FIRST_PARTY", "authoritative_token_counts": "VERIFIED_FIRST_PARTY",
+        "model_identity": "VERIFIED_FIRST_PARTY", "tool_calls": "VERIFIED_FIRST_PARTY", "session_identity": "VERIFIED_FIRST_PARTY",
+        "agent_identity": "PARTIAL", "request_latency": "VERIFIED_FIRST_PARTY", "errors_retries": "VERIFIED_FIRST_PARTY",
+        "global_configuration": "VERIFIED_FIRST_PARTY", "zero_repository_contamination": "PARTIAL", "inference_proxy": "MUST_NOT_BE_USED",
+    },
+    "codex": {
+        "native_otel": "VERIFIED_FIRST_PARTY", "signals": "logs,metrics,traces", "hooks_or_events": "VERIFIED_FIRST_PARTY",
+        "subscription_telemetry": "VERIFIED_FIRST_PARTY", "authoritative_token_counts": "PARTIAL", "model_identity": "VERIFIED_FIRST_PARTY",
+        "tool_calls": "VERIFIED_FIRST_PARTY", "session_identity": "PARTIAL", "agent_identity": "PARTIAL",
+        "request_latency": "VERIFIED_FIRST_PARTY", "errors_retries": "VERIFIED_FIRST_PARTY", "global_configuration": "VERIFIED_FIRST_PARTY",
+        "zero_repository_contamination": "PARTIAL", "inference_proxy": "MUST_NOT_BE_USED",
+    },
+    "gemini": {
+        "native_otel": "VERIFIED_FIRST_PARTY", "signals": "logs,metrics,traces", "hooks_or_events": "VERIFIED_FIRST_PARTY",
+        "subscription_telemetry": "PARTIAL", "authoritative_token_counts": "PARTIAL", "model_identity": "VERIFIED_FIRST_PARTY",
+        "tool_calls": "VERIFIED_FIRST_PARTY", "session_identity": "VERIFIED_FIRST_PARTY", "agent_identity": "VERIFIED_FIRST_PARTY",
+        "request_latency": "VERIFIED_FIRST_PARTY", "errors_retries": "VERIFIED_FIRST_PARTY", "global_configuration": "VERIFIED_FIRST_PARTY",
+        "zero_repository_contamination": "PARTIAL", "inference_proxy": "MUST_NOT_BE_USED",
+    },
+    "cursor": {
+        "native_otel": "UNKNOWN", "signals": "structured-output/events", "hooks_or_events": "VERIFIED_FIRST_PARTY",
+        "subscription_telemetry": "VERIFIED_FIRST_PARTY", "authoritative_token_counts": "PARTIAL", "model_identity": "VERIFIED_FIRST_PARTY",
+        "tool_calls": "VERIFIED_FIRST_PARTY", "session_identity": "VERIFIED_FIRST_PARTY", "agent_identity": "UNKNOWN",
+        "request_latency": "PARTIAL", "errors_retries": "PARTIAL", "global_configuration": "VERIFIED_FIRST_PARTY",
+        "zero_repository_contamination": "PARTIAL", "inference_proxy": "MUST_NOT_BE_USED",
+    },
+    "kimi": {
+        "native_otel": "UNKNOWN", "signals": "stream-json/hooks", "hooks_or_events": "VERIFIED_FIRST_PARTY",
+        "subscription_telemetry": "VERIFIED_FIRST_PARTY", "authoritative_token_counts": "PARTIAL", "model_identity": "VERIFIED_FIRST_PARTY",
+        "tool_calls": "VERIFIED_FIRST_PARTY", "session_identity": "VERIFIED_FIRST_PARTY", "agent_identity": "VERIFIED_FIRST_PARTY",
+        "request_latency": "PARTIAL", "errors_retries": "PARTIAL", "global_configuration": "VERIFIED_FIRST_PARTY",
+        "zero_repository_contamination": "PARTIAL", "inference_proxy": "MUST_NOT_BE_USED",
+    },
+    "grok": {
+        "native_otel": "UNKNOWN", "signals": "structured-output/sessions", "hooks_or_events": "VERIFIED_FIRST_PARTY",
+        "subscription_telemetry": "PARTIAL", "authoritative_token_counts": "PARTIAL", "model_identity": "VERIFIED_FIRST_PARTY",
+        "tool_calls": "VERIFIED_FIRST_PARTY", "session_identity": "VERIFIED_FIRST_PARTY", "agent_identity": "PARTIAL",
+        "request_latency": "PARTIAL", "errors_retries": "PARTIAL", "global_configuration": "PARTIAL",
+        "zero_repository_contamination": "PARTIAL", "inference_proxy": "MUST_NOT_BE_USED",
+    },
+    "jsonl": {
+        "native_otel": "UNSUPPORTED", "signals": "jsonl", "hooks_or_events": "SUPPORTED", "subscription_telemetry": "UNKNOWN",
+        "authoritative_token_counts": "UNKNOWN", "model_identity": "SUPPORTED_IF_REPORTED", "tool_calls": "SUPPORTED_IF_REPORTED",
+        "session_identity": "SUPPORTED_IF_REPORTED", "agent_identity": "SUPPORTED_IF_REPORTED", "request_latency": "SUPPORTED_IF_REPORTED",
+        "errors_retries": "SUPPORTED_IF_REPORTED", "global_configuration": "SUPPORTED", "zero_repository_contamination": "SUPPORTED",
+        "inference_proxy": "MUST_NOT_BE_USED",
+    },
+    "openrouter": {
+        "native_otel": "SUPPORTED_NOT_LOCALLY_VERIFIED", "signals": "gateway-response/optional-otel", "hooks_or_events": "SUPPORTED_NOT_LOCALLY_VERIFIED",
+        "subscription_telemetry": "UNSUPPORTED", "authoritative_token_counts": "VERIFIED_FIRST_PARTY", "model_identity": "VERIFIED_FIRST_PARTY",
+        "tool_calls": "SUPPORTED_NOT_LOCALLY_VERIFIED", "session_identity": "PARTIAL", "agent_identity": "PARTIAL",
+        "request_latency": "VERIFIED_FIRST_PARTY", "errors_retries": "VERIFIED_FIRST_PARTY", "global_configuration": "SUPPORTED_NOT_LOCALLY_VERIFIED",
+        "zero_repository_contamination": "SUPPORTED_NOT_LOCALLY_VERIFIED", "inference_proxy": "MUST_NOT_BE_USED",
+    },
+    "direct-openai": {
+        "native_otel": "UNKNOWN", "signals": "response-envelope", "hooks_or_events": "PARTIAL", "subscription_telemetry": "UNSUPPORTED",
+        "authoritative_token_counts": "VERIFIED_FIRST_PARTY", "model_identity": "VERIFIED_FIRST_PARTY", "tool_calls": "VERIFIED_FIRST_PARTY",
+        "session_identity": "PARTIAL", "agent_identity": "PARTIAL", "request_latency": "SUPPORTED_IF_REPORTED", "errors_retries": "SUPPORTED_IF_REPORTED",
+        "global_configuration": "SUPPORTED_NOT_LOCALLY_VERIFIED", "zero_repository_contamination": "SUPPORTED_NOT_LOCALLY_VERIFIED", "inference_proxy": "MUST_NOT_BE_USED",
+    },
+    "direct-anthropic": {
+        "native_otel": "UNKNOWN", "signals": "response-envelope", "hooks_or_events": "PARTIAL", "subscription_telemetry": "UNSUPPORTED",
+        "authoritative_token_counts": "VERIFIED_FIRST_PARTY", "model_identity": "VERIFIED_FIRST_PARTY", "tool_calls": "VERIFIED_FIRST_PARTY",
+        "session_identity": "PARTIAL", "agent_identity": "UNKNOWN", "request_latency": "SUPPORTED_IF_REPORTED", "errors_retries": "SUPPORTED_IF_REPORTED",
+        "global_configuration": "SUPPORTED_NOT_LOCALLY_VERIFIED", "zero_repository_contamination": "SUPPORTED_NOT_LOCALLY_VERIFIED", "inference_proxy": "MUST_NOT_BE_USED",
+    },
+    "direct-google": {
+        "native_otel": "UNKNOWN", "signals": "response-envelope", "hooks_or_events": "PARTIAL", "subscription_telemetry": "UNSUPPORTED",
+        "authoritative_token_counts": "VERIFIED_FIRST_PARTY", "model_identity": "VERIFIED_FIRST_PARTY", "tool_calls": "VERIFIED_FIRST_PARTY",
+        "session_identity": "PARTIAL", "agent_identity": "UNKNOWN", "request_latency": "SUPPORTED_IF_REPORTED", "errors_retries": "SUPPORTED_IF_REPORTED",
+        "global_configuration": "SUPPORTED_NOT_LOCALLY_VERIFIED", "zero_repository_contamination": "SUPPORTED_NOT_LOCALLY_VERIFIED", "inference_proxy": "MUST_NOT_BE_USED",
+    },
+    "direct-xai": {
+        "native_otel": "SUPPORTED_NOT_LOCALLY_VERIFIED", "signals": "response-envelope", "hooks_or_events": "PARTIAL", "subscription_telemetry": "UNSUPPORTED",
+        "authoritative_token_counts": "VERIFIED_FIRST_PARTY", "model_identity": "VERIFIED_FIRST_PARTY", "tool_calls": "VERIFIED_FIRST_PARTY",
+        "session_identity": "PARTIAL", "agent_identity": "PARTIAL", "request_latency": "SUPPORTED_IF_REPORTED", "errors_retries": "SUPPORTED_IF_REPORTED",
+        "global_configuration": "SUPPORTED_NOT_LOCALLY_VERIFIED", "zero_repository_contamination": "SUPPORTED_NOT_LOCALLY_VERIFIED", "inference_proxy": "MUST_NOT_BE_USED",
+    },
+}
+
+for _client_key, _canonical_fields in _CAPABILITY_MATRIX_FIELDS.items():
+    _spec = CLIENT_SPECS[_client_key]
+    CLIENT_SPECS[_client_key] = replace(_spec, capabilities={**_spec.capabilities, **_canonical_fields})
 
 
 ALIASES = {
@@ -273,18 +456,50 @@ def _executable_candidates(spec: ClientSpec) -> tuple[str, ...]:
     }.get(spec.name, ())
 
 
+def _probe_executable_version(executable: str | None) -> dict[str, Any]:
+    """Run only the client's bounded version probe; never invoke inference."""
+
+    if executable is None:
+        return {"version": None, "version_probe_status": "not_installed"}
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"version": None, "version_probe_status": "timeout"}
+    except PermissionError:
+        return {"version": None, "version_probe_status": "blocked"}
+    except OSError:
+        return {"version": None, "version_probe_status": "unavailable"}
+    output = (result.stdout or result.stderr or "").strip()
+    version = next((line.strip() for line in output.splitlines() if line.strip()), None)
+    if version:
+        version = version[:160]
+    return {
+        "version": version,
+        "version_probe_status": "verified" if result.returncode == 0 and version else "returned_no_version" if result.returncode == 0 else "failed",
+    }
+
+
 def discover_client(name: str) -> dict[str, Any]:
     spec = client_spec(name)
     executable = next((shutil.which(candidate) for candidate in _executable_candidates(spec) if shutil.which(candidate)), None)
+    version_evidence = _probe_executable_version(executable)
     path = config_path(spec)
     return {
         "client": spec.name,
         "provider": spec.provider,
         "installed": executable is not None,
         "executable": executable,
+        **version_evidence,
         "config_path": str(path) if path else None,
         "config_exists": bool(path and path.exists()),
-        "capabilities": spec.capabilities_record(installed=executable is not None).to_mapping(),
+        "capabilities": spec.capabilities_record(installed=executable is not None, version_probe_status=version_evidence.get("version_probe_status")).to_mapping(),
         "inference_proxy": False,
     }
 
@@ -300,7 +515,7 @@ def _claude_values(*, enable_traces: bool) -> dict[str, str]:
         "OTEL_METRICS_EXPORTER": "otlp",
         "OTEL_LOGS_EXPORTER": "otlp",
         "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
-        "OTEL_EXPORTER_OTLP_ENDPOINT": LOCAL_OTLP_GRPC,
+        "OTEL_EXPORTER_OTLP_ENDPOINT": _otlp_grpc_endpoint(),
         "OTEL_LOG_USER_PROMPTS": "0",
         "OTEL_LOG_TOOL_DETAILS": "0",
         "OTEL_LOG_TOOL_CONTENT": "0",
@@ -311,21 +526,52 @@ def _claude_values(*, enable_traces: bool) -> dict[str, str]:
     return values
 
 
-def _gemini_values() -> dict[str, Any]:
+def _gemini_values(*, enable_traces: bool = False) -> dict[str, Any]:
     return {
         "enabled": True,
-        "traces": False,
+        "traces": enable_traces,
         "target": "local",
-        "otlpEndpoint": LOCAL_OTLP_GRPC,
+        "otlpEndpoint": _otlp_grpc_endpoint(),
         "otlpProtocol": "grpc",
         "logPrompts": False,
         "useCollector": True,
     }
 
 
+def _configured_otlp_endpoint(environment_name: str, default: str) -> str:
+    """Resolve an operator-selected local OTLP endpoint safely.
+
+    The normal installation remains on the conventional loopback ports.  A
+    disposable acceptance project can override those ports without stopping
+    another local Observatory stack, but endpoint values are still restricted
+    to credential-free HTTP(S) URLs.
+    """
+
+    value = os.environ.get(environment_name, "").strip()
+    if not value:
+        return default
+    if len(value) > 512:
+        raise ValueError(f"{environment_name} is too long")
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError(f"{environment_name} must be a credential-free HTTP(S) endpoint")
+    if parsed.query or parsed.fragment:
+        raise ValueError(f"{environment_name} must not include a query or fragment")
+    return value.rstrip("/")
+
+
+def _otlp_grpc_endpoint() -> str:
+    return _configured_otlp_endpoint("OBSERVATORY_OTLP_GRPC_ENDPOINT", LOCAL_OTLP_GRPC)
+
+
+def _otlp_http_endpoint() -> str:
+    return _configured_otlp_endpoint("OBSERVATORY_OTLP_HTTP_ENDPOINT", LOCAL_OTLP_HTTP)
+
+
 def _codex_block(*, enable_traces: bool) -> str:
+    http_endpoint = _otlp_http_endpoint()
     trace_setting = (
-        'trace_exporter = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/traces", protocol = "json" } }\n'
+        f'trace_exporter = {{ otlp-http = {{ endpoint = "{http_endpoint}/v1/traces", protocol = "json" }} }}\n'
         if enable_traces
         else 'trace_exporter = "none"\n'
     )
@@ -333,8 +579,8 @@ def _codex_block(*, enable_traces: bool) -> str:
         "# BEGIN LLM Observatory managed telemetry\n"
         "[otel]\n"
         "environment = \"llm-observatory\"\n"
-        'exporter = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/logs", protocol = "json" } }\n'
-        'metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/metrics", protocol = "json" } }\n'
+        f'exporter = {{ otlp-http = {{ endpoint = "{http_endpoint}/v1/logs", protocol = "json" }} }}\n'
+        f'metrics_exporter = {{ otlp-http = {{ endpoint = "{http_endpoint}/v1/metrics", protocol = "json" }} }}\n'
         f"{trace_setting}"
         "log_user_prompt = false\n"
         "# END LLM Observatory managed telemetry\n"
@@ -343,6 +589,21 @@ def _codex_block(*, enable_traces: bool) -> str:
 
 def _managed_block_hash(block: str) -> str:
     return hashlib.sha256(block.rstrip("\n").encode("utf-8")).hexdigest()
+
+
+def _contains_embedded_credentials(value: Any) -> bool:
+    """Reject endpoint values that would make managed state secret-bearing."""
+
+    if not isinstance(value, str) or not value.strip():
+        return False
+    text = value.strip()
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        parsed = None
+    if parsed is not None and (parsed.username or parsed.password):
+        return True
+    return bool(re.search(r"(?i)(?:bearer\s+|(?:api[_-]?key|access[_-]?token|client[_-]?secret|password|credential)\s*[=:])", text))
 
 
 def plan_configuration(name: str, *, enable_traces: bool = False) -> dict[str, Any]:
@@ -357,7 +618,9 @@ def plan_configuration(name: str, *, enable_traces: bool = False) -> dict[str, A
         "config_path": str(path) if path else None,
         "config_exists": bool(path and path.exists()),
         "installed": discovered["installed"],
-        "capabilities": spec.capabilities_record(installed=discovered["installed"]).to_mapping(),
+        "version": discovered.get("version"),
+        "version_probe_status": discovered.get("version_probe_status"),
+        "capabilities": spec.capabilities_record(installed=discovered["installed"], version_probe_status=discovered.get("version_probe_status")).to_mapping(),
         "changes": {},
         "apply_required": bool(spec.native_config),
         "supported": spec.native_config,
@@ -365,7 +628,7 @@ def plan_configuration(name: str, *, enable_traces: bool = False) -> dict[str, A
     if spec.config_kind == "claude-json":
         plan["changes"] = {"env": _claude_values(enable_traces=enable_traces)}
     elif spec.config_kind == "gemini-json":
-        plan["changes"] = {"telemetry": _gemini_values()}
+        plan["changes"] = {"telemetry": _gemini_values(enable_traces=enable_traces)}
     elif spec.config_kind == "codex-toml":
         plan["changes"] = {"toml_block": _codex_block(enable_traces=enable_traces)}
     else:
@@ -382,22 +645,32 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
+def _write_text_atomic(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".observatory.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
-        handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        handle.write(value)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
 
 
-def _apply_json(spec: ClientSpec, *, enable_traces: bool, force: bool) -> dict[str, Any]:
+def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
+    _write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def _apply_json(
+    spec: ClientSpec,
+    *,
+    enable_traces: bool,
+    force: bool,
+    managed_state: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     path = config_path(spec)
     if path is None:
         raise ValueError(f"client {spec.name} does not have a JSON configuration path")
     current = _read_json_object(path)
-    desired = _claude_values(enable_traces=enable_traces) if spec.config_kind == "claude-json" else _gemini_values()
+    desired = _claude_values(enable_traces=enable_traces) if spec.config_kind == "claude-json" else _gemini_values(enable_traces=enable_traces)
     section_name = "env" if spec.config_kind == "claude-json" else "telemetry"
     section = current.get(section_name)
     if section is None:
@@ -405,8 +678,34 @@ def _apply_json(spec: ClientSpec, *, enable_traces: bool, force: bool) -> dict[s
     if not isinstance(section, dict):
         raise ValueError(f"{path} has a non-object {section_name} section")
     conflicts = {key: section[key] for key in desired if key in section and section[key] != desired[key]}
+    sensitive_conflicts = [key for key, value in conflicts.items() if _contains_embedded_credentials(value)]
+    if sensitive_conflicts:
+        return {
+            "changed": False,
+            "conflicts": [f"{key} contains embedded credentials; refusing to persist or force-overwrite it" for key in sorted(sensitive_conflicts)],
+            "path": str(path),
+            "inference_proxy": False,
+        }
     if conflicts and not force:
         return {"changed": False, "conflicts": sorted(conflicts), "path": str(path), "inference_proxy": False}
+    prior_state = dict(managed_state or {})
+    ownership: dict[str, dict[str, Any]] = {}
+    for key in desired:
+        prior = prior_state.get(key)
+        if isinstance(prior, Mapping) and isinstance(prior.get("present"), bool):
+            entry = {"present": prior["present"]}
+            if prior["present"]:
+                entry["value"] = prior.get("value")
+            entry["managed"] = desired[key]
+            ownership[key] = entry
+        elif key in section:
+            ownership[key] = {"present": True, "value": section[key], "managed": desired[key]}
+        else:
+            ownership[key] = {"present": False, "managed": desired[key]}
+    for key, prior in prior_state.items():
+        if key in ownership or not isinstance(prior, Mapping) or not isinstance(prior.get("present"), bool):
+            continue
+        ownership[key] = dict(prior)
     changed = False
     for key, value in desired.items():
         if section.get(key) != value:
@@ -421,7 +720,8 @@ def _apply_json(spec: ClientSpec, *, enable_traces: bool, force: bool) -> dict[s
         "changed": changed,
         "conflicts": sorted(conflicts),
         "path": str(path),
-        "managed_keys": sorted(desired),
+        "managed_keys": sorted(ownership),
+        "managed_state": ownership,
         "inference_proxy": False,
         "content_capture": False,
     }
@@ -460,7 +760,7 @@ def _apply_codex(*, enable_traces: bool, force: bool, managed_hash: str | None =
             line.strip() == "[otel]" or line.strip().startswith("[otel.")
             for line in existing.splitlines()
         )
-        if existing_otel_tables and not force:
+        if existing_otel_tables:
             return {"changed": False, "conflicts": ["otel table already exists"], "path": str(path), "inference_proxy": False}
         separator = "\n" if existing and not existing.endswith("\n") else ""
         new_text = existing + separator + block
@@ -485,25 +785,43 @@ def _apply_codex(*, enable_traces: bool, force: bool, managed_hash: str | None =
     }
 
 
-def apply_configuration(name: str, *, enable_traces: bool = False, force: bool = False, managed_hash: str | None = None) -> dict[str, Any]:
+def apply_configuration(
+    name: str,
+    *,
+    enable_traces: bool = False,
+    force: bool = False,
+    managed_hash: str | None = None,
+    managed_state: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     spec = client_spec(name)
     discovered = discover_client(name)
     if not spec.native_config:
         result = plan_configuration(name, enable_traces=enable_traces)
         result["applied"] = False
         return result
-    result = _apply_codex(enable_traces=enable_traces, force=force, managed_hash=managed_hash) if spec.config_kind == "codex-toml" else _apply_json(spec, enable_traces=enable_traces, force=force)
+    result = (
+        _apply_codex(enable_traces=enable_traces, force=force, managed_hash=managed_hash)
+        if spec.config_kind == "codex-toml"
+        else _apply_json(spec, enable_traces=enable_traces, force=force, managed_state=managed_state)
+    )
     result.update({
         "client": spec.name,
         "provider": spec.provider,
         "applied": not bool(result.get("conflicts")),
         "mode": "native-otlp",
-        "capabilities": spec.capabilities_record(installed=discovered["installed"]).to_mapping(),
+        "version": discovered.get("version"),
+        "version_probe_status": discovered.get("version_probe_status"),
+        "capabilities": spec.capabilities_record(installed=discovered["installed"], version_probe_status=discovered.get("version_probe_status")).to_mapping(),
     })
     return result
 
 
-def _remove_json(spec: ClientSpec, *, managed_keys: list[str] | None = None) -> dict[str, Any]:
+def _remove_json(
+    spec: ClientSpec,
+    *,
+    managed_keys: list[str] | None = None,
+    managed_state: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     path = config_path(spec)
     if path is None or not path.exists():
         return {"changed": False, "removed": [], "path": str(path) if path else None, "inference_proxy": False}
@@ -514,21 +832,74 @@ def _remove_json(spec: ClientSpec, *, managed_keys: list[str] | None = None) -> 
         return {"changed": False, "removed": [], "path": str(path), "inference_proxy": False}
     if not managed_keys:
         return {"changed": False, "removed": [], "path": str(path), "inference_proxy": False}
+    if not isinstance(managed_state, Mapping):
+        return {
+            "changed": False,
+            "removed": [],
+            "conflicts": ["managed JSON setting originals are unavailable; re-apply Observatory configuration before removal"],
+            "path": str(path),
+            "inference_proxy": False,
+        }
     desired = _claude_values(enable_traces=True) if spec.config_kind == "claude-json" else _gemini_values()
-    desired = {key: value for key, value in desired.items() if key in managed_keys}
-    removed = [key for key, value in desired.items() if section.get(key) == value]
-    for key in removed:
-        del section[key]
-    if removed:
+    conflicts: list[str] = []
+    for key in managed_keys:
+        owner = managed_state.get(key)
+        expected = owner.get("managed") if isinstance(owner, Mapping) else desired.get(key)
+        if expected is None:
+            conflicts.append(key)
+        elif key in section and section[key] != expected:
+            conflicts.append(key)
+    if conflicts:
+        return {
+            "changed": False,
+            "removed": [],
+            "conflicts": sorted(conflicts),
+            "path": str(path),
+            "inference_proxy": False,
+        }
+    restored: list[str] = []
+    removed: list[str] = []
+    for key in managed_keys:
+        owner = managed_state.get(key)
+        if not isinstance(owner, Mapping) or not isinstance(owner.get("present"), bool):
+            return {
+                "changed": False,
+                "removed": [],
+                "conflicts": [f"managed original for {key} is unavailable; re-apply Observatory configuration before removal"],
+                "path": str(path),
+                "inference_proxy": False,
+            }
+        if not owner["present"]:
+            if key in section:
+                del section[key]
+                removed.append(key)
+        else:
+            original = owner.get("value")
+            if section.get(key) != original:
+                section[key] = original
+                restored.append(key)
+    if removed or restored:
         if section:
             current[section_name] = section
         else:
             current.pop(section_name, None)
         _write_json_atomic(path, current)
-    return {"changed": bool(removed), "removed": sorted(removed), "path": str(path), "inference_proxy": False}
+    return {
+        "changed": bool(removed or restored),
+        "removed": sorted(removed),
+        "restored": sorted(restored),
+        "path": str(path),
+        "inference_proxy": False,
+    }
 
 
-def remove_configuration(name: str, *, managed_keys: list[str] | None = None, managed_hash: str | None = None) -> dict[str, Any]:
+def remove_configuration(
+    name: str,
+    *,
+    managed_keys: list[str] | None = None,
+    managed_hash: str | None = None,
+    managed_state: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     spec = client_spec(name)
     if spec.config_kind == "codex-toml":
         path = config_path(spec)
@@ -562,8 +933,8 @@ def remove_configuration(name: str, *, managed_keys: list[str] | None = None, ma
             }
         before = existing[:start_index]
         after = existing[end_index:]
-        path.write_text(before.rstrip() + ("\n" if after or before else "") + after.lstrip("\n"), encoding="utf-8")
+        _write_text_atomic(path, before.rstrip() + ("\n" if after or before else "") + after.lstrip("\n"))
         return {"changed": True, "removed": True, "path": str(path), "inference_proxy": False}
     if spec.config_kind in {"claude-json", "gemini-json"}:
-        return _remove_json(spec, managed_keys=managed_keys)
+        return _remove_json(spec, managed_keys=managed_keys, managed_state=managed_state)
     return {"changed": False, "removed": False, "path": None, "inference_proxy": False}

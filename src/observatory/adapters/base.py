@@ -19,6 +19,7 @@ class CapabilityRecord:
     auth_modes: tuple[str, ...] = ()
     evidence: tuple[str, ...] = ()
     last_verified: str | None = None
+    contract_version: str = "1"
 
     def to_mapping(self) -> dict[str, Any]:
         return {
@@ -29,6 +30,7 @@ class CapabilityRecord:
             "auth_modes": list(self.auth_modes),
             "evidence": list(self.evidence),
             "last_verified": self.last_verified,
+            "contract_version": self.contract_version,
         }
 
 
@@ -64,4 +66,3 @@ class AdapterRegistry:
 
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._adapters))
-

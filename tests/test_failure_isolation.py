@@ -49,11 +49,49 @@ class FailureIsolationTests(unittest.TestCase):
             self.assertEqual(before, after)
             self.assertEqual(len(list(Path(temp, "spool").glob("*.jsonl"))), 1)
 
+    def test_partial_api_acceptance_is_degraded_instead_of_reported_as_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            self.run_cli(["--state-dir", temp, "install"])
+            fixture = Path(temp) / "events.jsonl"
+            fixture.write_text(json.dumps(event_mapping()) + "\n", encoding="utf-8")
+            original_post = cli_module._post_events
+            try:
+                cli_module._post_events = lambda url, records: {"outcome": "accepted_with_rejections", "inserted": 1, "rejected": 1, "unavailable": 0}
+                code, result = self.run_cli(["--state-dir", temp, "ingest", "--file", str(fixture), "--url", "http://observatory.test/v1/events"])
+            finally:
+                cli_module._post_events = original_post
+            self.assertEqual(code, 5)
+            self.assertEqual(result["outcome"], "degraded")
+            self.assertEqual(result["data"]["mode"], "api")
+            self.assertEqual(result["data"]["rejected"], 1)
+            self.assertFalse(list(Path(temp, "spool").glob("*.jsonl")))
+
+    def test_outcome_commands_do_not_acknowledge_partial_api_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            self.run_cli(["--state-dir", temp, "install"])
+            original_post = cli_module._post_events
+            try:
+                cli_module._post_events = lambda url, records: {"outcome": "accepted_with_rejections", "inserted": 1, "rejected": 1, "unavailable": 0}
+                code, result = self.run_cli([
+                    "--state-dir", temp,
+                    "record-outcome",
+                    "--kind", "tests",
+                    "--status", "passed",
+                    "--url", "http://observatory.test/v1/events",
+                ])
+            finally:
+                cli_module._post_events = original_post
+            self.assertEqual(code, 5)
+            self.assertEqual(result["outcome"], "degraded")
+            self.assertEqual(result["data"]["mode"], "spooled")
+            self.assertEqual(len(list(Path(temp, "spool").glob("*.jsonl"))), 1)
+
     def test_default_deployment_queue_is_bounded_and_nonblocking(self) -> None:
         config = Path(__file__).resolve().parents[1] / "deployment" / "otel-collector" / "config.yaml"
         text = config.read_text(encoding="utf-8")
         self.assertIn("queue_size: 1024", text)
         self.assertIn("queue_size: 512", text)
+        self.assertIn("block_on_overflow: false", text)
         self.assertNotIn("block_on_overflow: true", text)
 
     def test_unknown_provider_and_duplicate_replay_remain_visible_without_causal_claims(self) -> None:
@@ -121,6 +159,35 @@ class FailureIsolationTests(unittest.TestCase):
             self.assertEqual(list(Path(temp, "spool").glob("*.jsonl")), [])
             with EventStore(Path(temp, "data", "events.sqlite3")) as store:
                 self.assertIsNotNone(store.get("flush-1"))
+
+    def test_offline_flush_retains_spool_when_store_capacity_rejects_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            self.run_cli(["--state-dir", temp, "install"])
+            fixture = Path(temp) / "events.jsonl"
+            value = event_mapping()
+            value["event_id"] = "flush-capacity-1"
+            fixture.write_text(json.dumps(value) + "\n", encoding="utf-8")
+            self.run_cli([
+                "--state-dir", temp,
+                "ingest",
+                "--file", str(fixture),
+                "--url", "http://127.0.0.1:1/v1/events",
+            ])
+            # The normal CLI uses its configured default; shrink the database
+            # guard through the process environment for this bounded replay.
+            import os
+            previous = os.environ.get("OBSERVATORY_MAX_DATABASE_BYTES")
+            os.environ["OBSERVATORY_MAX_DATABASE_BYTES"] = "1"
+            try:
+                code, result = self.run_cli(["--state-dir", temp, "flush", "--offline"])
+            finally:
+                if previous is None:
+                    os.environ.pop("OBSERVATORY_MAX_DATABASE_BYTES", None)
+                else:
+                    os.environ["OBSERVATORY_MAX_DATABASE_BYTES"] = previous
+            self.assertEqual(code, 5)
+            self.assertEqual(result["data"]["removed"], 0)
+            self.assertEqual(len(list(Path(temp, "spool").glob("*.jsonl"))), 1)
 
 
 if __name__ == "__main__":
