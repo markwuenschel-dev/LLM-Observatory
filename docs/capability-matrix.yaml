@@ -176,7 +176,7 @@ clients:
     evidence:
       - "https://moonshotai.github.io/kimi-code/en/reference/kimi-command"
       - "https://moonshotai.github.io/kimi-code/en/customization/hooks"
-      - "Local Kimi 0.28.1 --help/version verified; stream-json and hooks are supported, native OTel is UNKNOWN."
+      - "Local Kimi 0.28.1 --help/version verified; stream-json and hooks are supported, native OTel is UNKNOWN; the managed global observation-hook adapter is contract-tested."
   - provider: xai
     client: grok
     installed_version: 0.2.118
@@ -200,7 +200,7 @@ clients:
     evidence:
       - "https://docs.x.ai/build/features/skills-plugins-marketplaces"
       - "https://docs.x.ai/build/cli/reference"
-      - "Local Grok 0.2.118 --help/version verified; hooks, sessions, and trace-related CLI surfaces are present, native OTel is UNKNOWN."
+      - "Local Grok 0.2.118 --help/version verified; hooks, sessions, and trace-related CLI surfaces are present, native OTel is UNKNOWN; the managed global observation-hook adapter is contract-tested."
   - provider: openrouter
     client: openrouter-api
     installed_version: NOT_INSTALLED

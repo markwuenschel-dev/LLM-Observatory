@@ -16,7 +16,9 @@ import os
 from pathlib import Path
 import re
 import shutil
+import site
 import subprocess
+import sys
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -25,6 +27,8 @@ from .adapters.base import CapabilityRecord
 
 LOCAL_OTLP_GRPC = "http://127.0.0.1:4317"
 LOCAL_OTLP_HTTP = "http://127.0.0.1:4318"
+HOOK_MARKER_START = "# BEGIN LLM Observatory managed hook telemetry"
+HOOK_MARKER_END = "# END LLM Observatory managed hook telemetry"
 CAPABILITY_CONTRACT_VERSION = "1"
 CANONICAL_CAPABILITY_FIELDS = (
     "native_otel",
@@ -214,8 +218,9 @@ CLIENT_SPECS: dict[str, ClientSpec] = {
             "https://moonshotai.github.io/kimi-code/en/customization/hooks",
             "Local installation was detected; stream-json and hooks are supported but native OTel configuration was not verified.",
         ),
-        config_kind="discovery-only",
-        native_config=False,
+        config_kind="kimi-toml-hook",
+        config_path_hint="~/.kimi-code/config.toml",
+        native_config=True,
     ),
     "grok": ClientSpec(
         name="grok",
@@ -236,8 +241,9 @@ CLIENT_SPECS: dict[str, ClientSpec] = {
             "https://docs.x.ai/build/cli/reference",
             "Local capability research observed structured output, hooks, and session surfaces; native OTel was not verified.",
         ),
-        config_kind="discovery-only",
-        native_config=False,
+        config_kind="grok-toml-hook",
+        config_path_hint="~/.grok/config.toml",
+        native_config=True,
     ),
     "jsonl": ClientSpec(
         name="jsonl",
@@ -442,6 +448,10 @@ def config_path(spec: ClientSpec) -> Path | None:
         return home / ".claude" / "settings.json"
     if spec.config_kind == "gemini-json":
         return home / ".gemini" / "settings.json"
+    if spec.config_kind == "kimi-toml-hook":
+        return home / ".kimi-code" / "config.toml"
+    if spec.config_kind == "grok-toml-hook":
+        return home / ".grok" / "config.toml"
     return None
 
 
@@ -591,6 +601,73 @@ def _managed_block_hash(block: str) -> str:
     return hashlib.sha256(block.rstrip("\n").encode("utf-8")).hexdigest()
 
 
+def _configuration_mode(spec: ClientSpec) -> str:
+    if spec.config_kind in {"kimi-toml-hook", "grok-toml-hook"}:
+        return "global-hook"
+    if spec.native_config:
+        return "native-otlp"
+    return spec.config_kind
+
+
+def _hook_command(client: str) -> str:
+    launcher = shutil.which("observatory")
+    if os.name == "nt":
+        user_scripts = Path(site.getuserbase()) / f"Python{sys.version_info.major}{sys.version_info.minor}" / "Scripts" / "observatory.exe"
+        if user_scripts.exists():
+            launcher = str(user_scripts)
+    executable = f'"{launcher}"' if launcher and any(character.isspace() for character in launcher) else launcher or "observatory"
+    return f"{executable} hook --client {client} --quiet"
+
+
+def _toml_string(value: str) -> str:
+    """Encode a command as a TOML basic string without leaking path escapes."""
+
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _hook_block(spec: ClientSpec) -> str:
+    """Return a marked, user-level, observation-only hook configuration."""
+
+    command = _hook_command(spec.name)
+    if spec.config_kind == "kimi-toml-hook":
+        return (
+            f"{HOOK_MARKER_START}\n"
+            "[[hooks]]\n"
+            'event = "Notification"\n'
+            f"command = {_toml_string(command)}\n"
+            "timeout = 2\n"
+            "[[hooks]]\n"
+            'event = "Interrupt"\n'
+            f"command = {_toml_string(command)}\n"
+            "timeout = 2\n"
+            "[[hooks]]\n"
+            'event = "PreCompact"\n'
+            f"command = {_toml_string(command)}\n"
+            "timeout = 2\n"
+            "[[hooks]]\n"
+            'event = "PostCompact"\n'
+            f"command = {_toml_string(command)}\n"
+            "timeout = 2\n"
+            f"{HOOK_MARKER_END}\n"
+        )
+    if spec.config_kind == "grok-toml-hook":
+        events = ("SessionStart", "SessionEnd", "PostToolUse")
+        body = [HOOK_MARKER_START]
+        for event in events:
+            body.extend(
+                (
+                    f"[[hooks.{event}]]",
+                    f"[[hooks.{event}.hooks]]",
+                    'type = "command"',
+                    f"command = {_toml_string(command)}",
+                    "timeout = 2",
+                )
+            )
+        body.append(HOOK_MARKER_END)
+        return "\n".join(body) + "\n"
+    raise ValueError(f"client {spec.name} does not support a managed hook block")
+
+
 def _contains_embedded_credentials(value: Any) -> bool:
     """Reject endpoint values that would make managed state secret-bearing."""
 
@@ -613,7 +690,7 @@ def plan_configuration(name: str, *, enable_traces: bool = False) -> dict[str, A
     plan: dict[str, Any] = {
         "client": spec.name,
         "provider": spec.provider,
-        "mode": "native-otlp" if spec.native_config else spec.config_kind,
+        "mode": _configuration_mode(spec),
         "inference_proxy": False,
         "config_path": str(path) if path else None,
         "config_exists": bool(path and path.exists()),
@@ -631,8 +708,10 @@ def plan_configuration(name: str, *, enable_traces: bool = False) -> dict[str, A
         plan["changes"] = {"telemetry": _gemini_values(enable_traces=enable_traces)}
     elif spec.config_kind == "codex-toml":
         plan["changes"] = {"toml_block": _codex_block(enable_traces=enable_traces)}
+    elif spec.config_kind in {"kimi-toml-hook", "grok-toml-hook"}:
+        plan["changes"] = {"toml_block": _hook_block(spec)}
     else:
-        plan["warnings"] = ["No first-party global OTLP configuration contract is verified for this client; use the response/JSONL adapter or configure its native hooks separately."]
+        plan["warnings"] = ["No first-party global telemetry configuration contract is verified for this client; use the response/JSONL adapter or configure its native hooks separately."]
     return plan
 
 
@@ -718,7 +797,11 @@ def _apply_json(
         _write_json_atomic(path, current)
     return {
         "changed": changed,
-        "conflicts": sorted(conflicts),
+        # A reviewed --force apply is an accepted overwrite, not an
+        # unresolved conflict. Keep an explicit audit field for callers that
+        # want to display what was replaced.
+        "conflicts": [] if force else sorted(conflicts),
+        "overwritten": sorted(conflicts) if force else [],
         "path": str(path),
         "managed_keys": sorted(ownership),
         "managed_state": ownership,
@@ -785,6 +868,50 @@ def _apply_codex(*, enable_traces: bool, force: bool, managed_hash: str | None =
     }
 
 
+def _apply_hook(spec: ClientSpec, *, managed_hash: str | None = None) -> dict[str, Any]:
+    path = config_path(spec)
+    if path is None:
+        raise ValueError(f"client {spec.name} does not have a hook configuration path")
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if HOOK_MARKER_START in existing and HOOK_MARKER_END not in existing:
+        raise ValueError(f"incomplete Observatory hook block in {path}")
+    block = _hook_block(spec)
+    if HOOK_MARKER_START in existing:
+        start_index = existing.index(HOOK_MARKER_START)
+        end_index = existing.index(HOOK_MARKER_END, start_index) + len(HOOK_MARKER_END)
+        current_block = existing[start_index:end_index]
+        expected_hash = managed_hash or _managed_block_hash(block)
+        if _managed_block_hash(current_block) != expected_hash:
+            return {
+                "changed": False,
+                "conflicts": ["managed Observatory hook block changed by user"],
+                "path": str(path),
+                "inference_proxy": False,
+                "managed_block": True,
+                "managed_keys": ["managed_block"],
+            }
+        before = existing[:start_index]
+        after = existing[end_index:]
+        new_text = before + block.rstrip("\n") + after
+        changed = new_text != existing
+    else:
+        separator = "\n" if existing and not existing.endswith("\n") else ""
+        new_text = existing + separator + block
+        changed = True
+    if changed:
+        _write_text_atomic(path, new_text)
+    return {
+        "changed": changed,
+        "conflicts": [],
+        "path": str(path),
+        "managed_block": True,
+        "managed_keys": ["managed_block"],
+        "managed_hash": _managed_block_hash(block),
+        "inference_proxy": False,
+        "content_capture": False,
+    }
+
+
 def apply_configuration(
     name: str,
     *,
@@ -802,13 +929,15 @@ def apply_configuration(
     result = (
         _apply_codex(enable_traces=enable_traces, force=force, managed_hash=managed_hash)
         if spec.config_kind == "codex-toml"
+        else _apply_hook(spec, managed_hash=managed_hash)
+        if spec.config_kind in {"kimi-toml-hook", "grok-toml-hook"}
         else _apply_json(spec, enable_traces=enable_traces, force=force, managed_state=managed_state)
     )
     result.update({
         "client": spec.name,
         "provider": spec.provider,
         "applied": not bool(result.get("conflicts")),
-        "mode": "native-otlp",
+        "mode": _configuration_mode(spec),
         "version": discovered.get("version"),
         "version_probe_status": discovered.get("version_probe_status"),
         "capabilities": spec.capabilities_record(installed=discovered["installed"], version_probe_status=discovered.get("version_probe_status")).to_mapping(),
@@ -901,6 +1030,38 @@ def remove_configuration(
     managed_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     spec = client_spec(name)
+    if spec.config_kind in {"kimi-toml-hook", "grok-toml-hook"}:
+        path = config_path(spec)
+        if path is None or not path.exists() or not managed_keys or "managed_block" not in managed_keys:
+            return {"changed": False, "removed": False, "path": str(path) if path else None, "inference_proxy": False}
+        existing = path.read_text(encoding="utf-8")
+        if HOOK_MARKER_START not in existing:
+            return {"changed": False, "removed": False, "path": str(path), "inference_proxy": False}
+        if HOOK_MARKER_END not in existing:
+            raise ValueError(f"incomplete Observatory hook block in {path}")
+        if not managed_hash:
+            return {
+                "changed": False,
+                "removed": False,
+                "conflicts": ["managed hook block hash is required before removal"],
+                "path": str(path),
+                "inference_proxy": False,
+            }
+        start_index = existing.index(HOOK_MARKER_START)
+        end_index = existing.index(HOOK_MARKER_END, start_index) + len(HOOK_MARKER_END)
+        current_block = existing[start_index:end_index]
+        if _managed_block_hash(current_block) != managed_hash:
+            return {
+                "changed": False,
+                "removed": False,
+                "conflicts": ["managed Observatory hook block changed by user"],
+                "path": str(path),
+                "inference_proxy": False,
+            }
+        before = existing[:start_index]
+        after = existing[end_index:]
+        _write_text_atomic(path, before.rstrip() + ("\n" if after or before else "") + after.lstrip("\n"))
+        return {"changed": True, "removed": True, "path": str(path), "inference_proxy": False}
     if spec.config_kind == "codex-toml":
         path = config_path(spec)
         if path is None or not path.exists() or not managed_keys or "managed_block" not in managed_keys:

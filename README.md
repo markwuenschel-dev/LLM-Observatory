@@ -108,15 +108,21 @@ pnpm self-update
 
 Do not install pnpm as a prerequisite for the Python Observatory CLI.
 
-## Native client configuration
+## Always-on client telemetry
 
-The capability-backed configuration planner supports Claude Code, Codex, and Gemini. Plans are read-only by default:
+Configure the user-level clients once. Their normal subscription/API inference path stays unchanged; Observatory receives metadata only, with prompt/tool content disabled:
 
 ```powershell
-uvx --python 3.14 --from . observatory --state-dir $state configure claude
+uvx --python 3.14 --from . observatory --state-dir $state configure claude --apply --traces
+uvx --python 3.14 --from . observatory --state-dir $state configure codex --apply --traces
+uvx --python 3.14 --from . observatory --state-dir $state configure gemini --apply --traces
+uvx --python 3.14 --from . observatory --state-dir $state configure kimi --apply
+uvx --python 3.14 --from . observatory --state-dir $state configure grok --apply
 ```
 
-Use `configure claude --apply` only after reviewing the displayed ownership plan. The Observatory never sets provider base URLs, proxy variables, credentials, or repository files. A real-client acceptance run requires an explicit operator-authorized client command:
+Claude Code, Codex, and Gemini use their documented global OTLP settings. Kimi and Grok use marked global observation hooks that call the fail-open `observatory hook` adapter. The hook resolves the current working directory to a privacy-safe project identity, so a new Git repository appears automatically without repository files, dependencies, or hooks. If the Collector or API is unavailable, the hook spools bounded metadata or drops it; it never blocks inference. Cursor remains adapter-only until a verified global hook/OTLP contract exists.
+
+Review a plan without changing user files by omitting `--apply`. The Observatory never sets provider base URLs, proxy variables, credentials, or repository files. A real-client acceptance run requires an explicit operator-authorized client command:
 
 ```powershell
 pwsh -NoProfile -File .\scripts\provider-acceptance.ps1 `

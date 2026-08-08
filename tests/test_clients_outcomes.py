@@ -216,6 +216,41 @@ class ClientAndOutcomeTests(unittest.TestCase):
         self.assertFalse(plan_configuration("gemini", enable_traces=False)["changes"]["telemetry"]["traces"])
         self.assertTrue(plan_configuration("gemini", enable_traces=True)["changes"]["telemetry"]["traces"])
 
+    def test_kimi_and_grok_global_hook_blocks_are_valid_and_reversible(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            environment = __import__("os").environ
+            old_userprofile = environment.get("USERPROFILE")
+            old_codex_home = environment.get("CODEX_HOME")
+            environment["USERPROFILE"] = str(home)
+            environment.pop("CODEX_HOME", None)
+            try:
+                with patch("observatory.clients.shutil.which", return_value=None):
+                    kimi = apply_configuration("kimi")
+                    grok = apply_configuration("grok")
+                kimi_path = home / ".kimi-code" / "config.toml"
+                grok_path = home / ".grok" / "config.toml"
+                self.assertEqual(kimi["mode"], "global-hook")
+                self.assertEqual(grok["mode"], "global-hook")
+                self.assertEqual(tomllib.loads(kimi_path.read_text(encoding="utf-8"))["hooks"][0]["event"], "Notification")
+                self.assertEqual(tomllib.loads(grok_path.read_text(encoding="utf-8"))["hooks"]["SessionStart"][0]["hooks"][0]["type"], "command")
+
+                kimi_removed = remove_configuration("kimi", managed_keys=kimi["managed_keys"], managed_hash=kimi["managed_hash"])
+                grok_removed = remove_configuration("grok", managed_keys=grok["managed_keys"], managed_hash=grok["managed_hash"])
+                self.assertTrue(kimi_removed["removed"])
+                self.assertTrue(grok_removed["removed"])
+                self.assertEqual(kimi_path.read_text(encoding="utf-8").strip(), "")
+                self.assertEqual(grok_path.read_text(encoding="utf-8").strip(), "")
+            finally:
+                if old_userprofile is None:
+                    environment.pop("USERPROFILE", None)
+                else:
+                    environment["USERPROFILE"] = old_userprofile
+                if old_codex_home is None:
+                    environment.pop("CODEX_HOME", None)
+                else:
+                    environment["CODEX_HOME"] = old_codex_home
+
     def test_json_client_apply_is_atomic_and_preserves_unrelated_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
@@ -303,6 +338,33 @@ class ClientAndOutcomeTests(unittest.TestCase):
                     __import__("os").environ.pop("CODEX_HOME", None)
                 else:
                     __import__("os").environ["CODEX_HOME"] = old_codex_home
+
+    def test_force_apply_reports_reviewed_non_secret_overwrite_as_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            environment = __import__("os").environ
+            old_userprofile = environment.get("USERPROFILE")
+            old_codex_home = environment.get("CODEX_HOME")
+            environment["USERPROFILE"] = str(home)
+            environment.pop("CODEX_HOME", None)
+            try:
+                settings = home / ".gemini" / "settings.json"
+                settings.parent.mkdir(parents=True)
+                settings.write_text(json.dumps({"telemetry": {"traces": False}}), encoding="utf-8")
+                result = apply_configuration("gemini", enable_traces=True, force=True)
+                self.assertTrue(result["applied"])
+                self.assertEqual(result["conflicts"], [])
+                self.assertEqual(result["overwritten"], ["traces"])
+                self.assertTrue(json.loads(settings.read_text(encoding="utf-8"))["telemetry"]["traces"])
+            finally:
+                if old_userprofile is None:
+                    environment.pop("USERPROFILE", None)
+                else:
+                    environment["USERPROFILE"] = old_userprofile
+                if old_codex_home is None:
+                    environment.pop("CODEX_HOME", None)
+                else:
+                    environment["CODEX_HOME"] = old_codex_home
 
     def test_force_does_not_persist_embedded_credentials_from_existing_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

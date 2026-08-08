@@ -39,6 +39,7 @@ from .maintenance import backup_database, backup_state, inspect_backend_volume_c
 from .privacy import PrivacyPolicy, redact_event
 from .project import resolve_project
 from .outcomes import git_outcome_snapshot, make_outcome_event, run_command_outcome
+from .hooks import build_hook_event
 from .store import DEFAULT_MAX_DATABASE_BYTES, EventStore
 
 
@@ -54,6 +55,8 @@ MAX_SPOOL_FILES = 128
 MAX_INGEST_BYTES = 8 * 1024 * 1024
 MAX_INGEST_RECORDS = 256
 MAX_INGEST_ERRORS = 256
+MAX_HOOK_INPUT_BYTES = 512 * 1024
+DEFAULT_HOOK_SEND_TIMEOUT = 0.25
 DEFAULT_OPERATION_TIMEOUT = 180.0
 DEFAULT_MIN_FREE_BYTES = 1 * 1024 ** 3
 DEFAULT_MAX_BACKEND_VOLUME_BYTES = 16 * 1024 ** 3
@@ -968,6 +971,47 @@ def _command_ingest(args: argparse.Namespace) -> dict[str, Any]:
         return _result("ingest", "degraded", EXIT_DEGRADED, data={"mode": "spooled", "path": str(spool), "count": len(safe)}, warnings=[f"API unavailable: {exc}"], errors=errors)
 
 
+def _command_hook(args: argparse.Namespace) -> dict[str, Any]:
+    """Capture one client hook observation without ever blocking inference."""
+
+    try:
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        raw = stream.read(MAX_HOOK_INPUT_BYTES + 1)
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        if len(raw) > MAX_HOOK_INPUT_BYTES:
+            return _result("hook", "degraded", EXIT_OK, data={"mode": "dropped", "reason": "payload_too_large", "telemetry_lost": True})
+        payload = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+        if not isinstance(payload, Mapping):
+            return _result("hook", "degraded", EXIT_OK, data={"mode": "dropped", "reason": "payload_not_object", "telemetry_lost": True})
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return _result("hook", "degraded", EXIT_OK, data={"mode": "dropped", "reason": "invalid_payload", "telemetry_lost": True})
+
+    try:
+        event = redact_event(build_hook_event(args.client, payload, project_path=args.project_path))
+        record = event.to_mapping()
+    except Exception:
+        # Hook adapters are deliberately fail-open.  A malformed provider
+        # payload must not turn an otherwise healthy client invocation into a
+        # failed inference request.
+        return _result("hook", "degraded", EXIT_OK, data={"mode": "dropped", "reason": "normalization_failed", "telemetry_lost": True})
+
+    paths = _paths(args)
+    if not paths.config.exists():
+        return _result("hook", "degraded", EXIT_OK, data={"mode": "not_initialized", "event_id": event.event_id, "telemetry_lost": True})
+    timeout = max(0.05, min(float(args.send_timeout), 0.75))
+    try:
+        response = _post_events(args.url, [record], timeout=timeout)
+        _require_accepted_response(response, "hook")
+        return _result("hook", "success", EXIT_OK, data={"mode": "api", "event_id": event.event_id})
+    except Exception:
+        try:
+            spool = _spool(paths, [record])
+        except Exception:
+            return _result("hook", "degraded", EXIT_OK, data={"mode": "dropped", "event_id": event.event_id, "telemetry_lost": True})
+        return _result("hook", "degraded", EXIT_OK, data={"mode": "spooled", "event_id": event.event_id, "path": str(spool)})
+
+
 def _command_record_outcome(args: argparse.Namespace) -> dict[str, Any]:
     paths = _paths(args)
     if not paths.config.exists():
@@ -1876,6 +1920,12 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--url", default="http://127.0.0.1:8787/v1/events")
     ingest.add_argument("--offline", action="store_true")
     ingest.add_argument("--project-path", default=str(Path.cwd()), help="project directory used when records omit project identity")
+    hook = sub.add_parser("hook", help="capture one client hook event as metadata-only telemetry")
+    hook.add_argument("--client", required=True)
+    hook.add_argument("--url", default="http://127.0.0.1:8787/v1/events")
+    hook.add_argument("--project-path", default=str(Path.cwd()))
+    hook.add_argument("--send-timeout", type=float, default=DEFAULT_HOOK_SEND_TIMEOUT)
+    hook.add_argument("--quiet", action="store_true", help="suppress hook status output for client integrations")
     flush = sub.add_parser("flush")
     flush.add_argument("--url", default="http://127.0.0.1:8787/v1/events")
     flush.add_argument("--offline", action="store_true", help="replay the bounded spool into the local SQLite store")
@@ -1954,6 +2004,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             value = _command_doctor(args)
         elif args.command == "ingest":
             value = _command_ingest(args)
+        elif args.command == "hook":
+            value = _command_hook(args)
         elif args.command == "flush":
             if args.max_files < 1 or args.max_files > MAX_SPOOL_FILES:
                 value = _result("flush", "failed", EXIT_USAGE, errors=[f"max-files must be between 1 and {MAX_SPOOL_FILES}"])
@@ -2009,6 +2061,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             value = _result(args.command, "failed", EXIT_USAGE, errors=["unsupported command"])
     except (OSError, RuntimeError, ValueError) as exc:
         value = _result(args.command, "failed", EXIT_FAILED, errors=[str(exc)])
+    if args.command == "hook" and args.quiet:
+        return int(value["exit_code"])
     return _print_result(value, args.json_mode)
 
 
