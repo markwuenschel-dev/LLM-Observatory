@@ -1,0 +1,33 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "panels": [
+    {"type": "timeseries", "id": 1, "title": "Agent hierarchy volume", "gridPos": {"h": 9, "w": 24, "x": 0, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(50, observatory_events_by_agent_total{event_type=~\"$event_type\",project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",agent=~\"$agent\",subagent=~\"$subagent\",parent_agent=~\"$parent_agent\"})", "legendFormat": "{{project}} / {{parent_agent}} / {{agent}} / {{subagent}}", "refId": "A"}]},
+    {"type": "timeseries", "id": 2, "title": "Agent behavior", "gridPos": {"h": 9, "w": 24, "x": 0, "y": 9}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [
+      {"expr": "sum by (parent_agent,agent,subagent) (observatory_tool_calls_by_context_total{event_type=~\"$event_type\",project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",agent=~\"$agent\",subagent=~\"$subagent\",parent_agent=~\"$parent_agent\"})", "legendFormat": "tool calls / {{parent_agent}} / {{agent}} / {{subagent}}", "refId": "A"},
+      {"expr": "sum by (parent_agent,agent,subagent) (observatory_files_changed_by_context_total{event_type=~\"$event_type\",project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",agent=~\"$agent\",subagent=~\"$subagent\",parent_agent=~\"$parent_agent\"})", "legendFormat": "files changed / {{parent_agent}} / {{agent}} / {{subagent}}", "refId": "B"},
+      {"expr": "sum by (parent_agent,agent,subagent) (observatory_commands_executed_by_context_total{event_type=~\"$event_type\",project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",agent=~\"$agent\",subagent=~\"$subagent\",parent_agent=~\"$parent_agent\"})", "legendFormat": "commands / {{parent_agent}} / {{agent}} / {{subagent}}", "refId": "C"},
+      {"expr": "sum by (parent_agent,agent,subagent) (observatory_tests_invoked_by_context_total{event_type=~\"$event_type\",project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",agent=~\"$agent\",subagent=~\"$subagent\",parent_agent=~\"$parent_agent\"})", "legendFormat": "tests / {{parent_agent}} / {{agent}} / {{subagent}}", "refId": "D"}
+    ]},
+    {"type": "timeseries", "id": 3, "title": "Failures and rework by hierarchy", "gridPos": {"h": 9, "w": 24, "x": 0, "y": 18}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [
+      {"expr": "sum by (parent_agent,agent,subagent) (observatory_agent_failures_by_context_total{event_type=~\"$event_type\",project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",agent=~\"$agent\",subagent=~\"$subagent\",parent_agent=~\"$parent_agent\"})", "legendFormat": "agent failures / {{parent_agent}} / {{agent}} / {{subagent}}", "refId": "A"},
+      {"expr": "sum by (parent_agent,agent,subagent) (observatory_rework_loops_by_context_total{event_type=~\"$event_type\",project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",agent=~\"$agent\",subagent=~\"$subagent\",parent_agent=~\"$parent_agent\"})", "legendFormat": "rework loops / {{parent_agent}} / {{agent}} / {{subagent}}", "refId": "B"}
+    ]},
+    {"type": "text", "id": 4, "title": "Evidence boundary", "gridPos": {"h": 6, "w": 24, "x": 0, "y": 27}, "options": {"mode": "markdown", "content": "Parent-agent, agent, and subagent labels are retained only when the source reports them. Missing hierarchy is `unknown`; this view does not infer ownership or causality. Raw prompts, tool arguments, paths, commands, results, and test payloads remain excluded by default. Use the event detail and attribution APIs for high-cardinality drill-down."}}
+  ],
+  "schemaVersion": 39,
+  "templating": {"list": [
+    {"name": "project", "label": "Project", "type": "query", "query": "label_values(observatory_events_by_context_total, project)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL PROJECTS", "value": "$__all"}},
+    {"name": "repository", "label": "Repository", "type": "query", "query": "label_values(observatory_events_by_context_total, repository)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "branch", "label": "Branch", "type": "query", "query": "label_values(observatory_events_by_context_total, branch)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "parent_agent", "label": "Parent agent", "type": "query", "query": "label_values(observatory_events_by_context_total, parent_agent)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "agent", "label": "Agent", "type": "query", "query": "label_values(observatory_events_by_context_total, agent)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "subagent", "label": "Subagent", "type": "query", "query": "label_values(observatory_events_by_context_total, subagent)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "event_type", "label": "Event type", "type": "query", "query": "label_values(observatory_events_by_context_total, event_type)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}}
+  ]},
+  "tags": ["llm", "agents", "subagents", "hierarchy"],
+  "time": {"from": "now-24h", "to": "now"},
+  "title": "Agent Hierarchy",
+  "uid": "agent-hierarchy",
+  "version": 1
+}

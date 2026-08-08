@@ -54,7 +54,9 @@ def make_outcome_event(
         "project": project.__dict__,
         "execution": {"task_id": task_id, "task_class": task_class},
         "reliability": {
-            "status": "succeeded" if status.casefold() in PASS_STATUSES else "failed" if status.casefold() in FAIL_STATUSES else "unknown",
+            "status": "succeeded" if status.casefold() in PASS_STATUSES else "failed" if status.casefold() in FAIL_STATUSES or status.casefold() == "timeout" else "unknown",
+            "timeout": status.casefold() == "timeout",
+            "aborted": status.casefold() == "aborted",
         },
         "outcome": {
             "kind": kind.strip(),

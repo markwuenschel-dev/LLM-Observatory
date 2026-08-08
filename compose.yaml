@@ -4,9 +4,10 @@ services:
   observatory-api:
     build:
       context: .
-    image: llm-observatory-api:0.1.0
-    command: ["python", "-m", "observatory.cli", "--state-dir", "/var/lib/observatory", "run-api", "--host", "0.0.0.0", "--port", "8787"]
+    image: ${OBSERVATORY_API_IMAGE:-llm-observatory-api:0.1.0}
+    command: ["python", "-m", "observatory.cli", "--state-dir", "/var/lib/observatory", "run-api", "--host", "0.0.0.0", "--allow-remote", "--allow-insecure-remote", "--port", "8787", "--max-database-bytes", "${OBSERVATORY_MAX_DATABASE_BYTES:-2147483648}"]
     restart: unless-stopped
+    stop_grace_period: 30s
     mem_limit: 512m
     cpus: 1.0
     volumes:
@@ -20,9 +21,13 @@ services:
       retries: 5
 
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:${OTEL_COLLECTOR_TAG:-0.158.0}
+    image: ${OTEL_COLLECTOR_IMAGE:-otel/opentelemetry-collector-contrib@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5}
     command: ["--config=/etc/otelcol/config.yaml"]
     restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      otel-queue-init:
+        condition: service_completed_successfully
     mem_limit: 512m
     cpus: 1.0
     volumes:
@@ -32,23 +37,28 @@ services:
       - "127.0.0.1:4317:4317"
       - "127.0.0.1:4318:4318"
       - "127.0.0.1:13133:13133"
+    expose:
+      - "8888"
     healthcheck:
       test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol/config.yaml"]
       interval: 10s
       timeout: 5s
       retries: 5
-    depends_on:
-      observatory-api:
-        condition: service_healthy
-      tempo:
-        condition: service_started
-      loki:
-        condition: service_started
+
+  otel-queue-init:
+    image: ${ALPINE_IMAGE:-alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1}
+    command: ["sh", "-c", "install -d -o 10001 -g 10001 -m 0700 /var/lib/otelcol/file_storage && chown -R 10001:10001 /var/lib/otelcol"]
+    restart: "no"
+    mem_limit: 64m
+    cpus: 0.10
+    volumes:
+      - otel-queue:/var/lib/otelcol
 
   tempo:
-    image: grafana/tempo:${TEMPO_TAG:-3.0.0}
+    image: ${TEMPO_IMAGE:-grafana/tempo@sha256:78439f7f7cf3c97122846c13a832e060c6c7ef67dcc814dccf0a5f3f78393a93}
     command: ["-config.file=/etc/tempo/tempo.yaml", "-config.expand-env=true"]
     restart: unless-stopped
+    stop_grace_period: 30s
     mem_limit: 1g
     cpus: 1.0
     environment:
@@ -61,15 +71,16 @@ services:
       - "4317"
       - "4318"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3200/ready >/dev/null 2>&1"]
+      test: ["CMD", "/tempo", "-health=true", "-health.url=http://127.0.0.1:3200/ready"]
       interval: 10s
       timeout: 3s
       retries: 5
 
   loki:
-    image: grafana/loki:${LOKI_TAG:-3.5.0}
+    image: ${LOKI_IMAGE:-grafana/loki@sha256:4c431d2e6b9b38718694b31c5d56be7c80dc69c513215fde1aeb5b02cd4e2665}
     command: ["-config.file=/etc/loki/loki.yaml", "-config.expand-env=true"]
     restart: unless-stopped
+    stop_grace_period: 30s
     mem_limit: 512m
     cpus: 1.0
     environment:
@@ -86,9 +97,10 @@ services:
       retries: 5
 
   prometheus:
-    image: prom/prometheus:${PROMETHEUS_TAG:-v3.5.0}
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996}
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus", "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-30d}", "--storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-8GB}"]
     restart: unless-stopped
+    stop_grace_period: 30s
     mem_limit: 512m
     cpus: 1.0
     volumes:
@@ -96,9 +108,6 @@ services:
       - prometheus-data:/prometheus
     expose:
       - "9090"
-    depends_on:
-      observatory-api:
-        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9090/-/ready >/dev/null 2>&1"]
       interval: 10s
@@ -106,8 +115,9 @@ services:
       retries: 5
 
   grafana:
-    image: grafana/grafana:${GRAFANA_TAG:-12.1.0}
+    image: ${GRAFANA_IMAGE:-grafana/grafana@sha256:6ac590e7cabc2fbe8d7b8fc1ce9c9f0582177b334e0df9c927ebd9670469440f}
     restart: unless-stopped
+    stop_grace_period: 30s
     mem_limit: 512m
     cpus: 1.0
     environment:
@@ -124,13 +134,6 @@ services:
       - grafana-data:/var/lib/grafana
     ports:
       - "127.0.0.1:3000:3000"
-    depends_on:
-      prometheus:
-        condition: service_healthy
-      tempo:
-        condition: service_healthy
-      loki:
-        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/api/health >/dev/null 2>&1"]
       interval: 10s

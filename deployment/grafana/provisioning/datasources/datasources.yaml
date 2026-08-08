@@ -1,12 +1,24 @@
 apiVersion: 1
 
 datasources:
-  - name: Prometheus
+  # The default Prometheus-compatible source is the read-only event-time
+  # facade on the normalizer.  It makes Grafana's time picker filter
+  # observed_at rather than the scrape timestamp of a current snapshot.
+  - name: Observatory Events
     uid: prometheus
     type: prometheus
     access: proxy
-    url: http://prometheus:9090
+    url: http://observatory-api:8787
     isDefault: true
+    jsonData:
+      httpMethod: POST
+  # Collector self-metrics retain the real Prometheus backend and are kept
+  # explicit on Reliability panels so telemetry-plane health remains visible.
+  - name: Prometheus
+    uid: system-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
     jsonData:
       httpMethod: POST
   - name: Tempo
@@ -20,10 +32,9 @@ datasources:
         filterByTraceID: true
         filterBySpanID: true
       tracesToMetrics:
-        datasourceUid: prometheus
+        datasourceUid: system-prometheus
   - name: Loki
     uid: loki
     type: loki
     access: proxy
     url: http://loki:3100
-

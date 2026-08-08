@@ -7,6 +7,7 @@ extensions:
       exporter_failure_threshold: 5
   file_storage:
     directory: /var/lib/otelcol
+    create_directory: true
     timeout: 1s
     max_size: 268435456
     fsync: true
@@ -27,6 +28,169 @@ processors:
     check_interval: 1s
     limit_mib: 256
     spike_limit_mib: 64
+  transform/project_identity:
+    error_mode: ignore
+    trace_statements:
+      - context: resource
+        statements:
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.project.root"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.project.root"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.project.path"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.project.path"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["process.cwd"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["process.cwd"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["process.working_directory"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["process.working_directory"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["cwd"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["cwd"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["current_working_directory"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["current_working_directory"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.cwd"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.cwd"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.repository.root"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.repository.root"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.worktree.path"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.worktree.path"] != nil
+    log_statements:
+      - context: resource
+        statements:
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.project.root"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.project.root"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.project.path"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.project.path"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["process.cwd"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["process.cwd"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["process.working_directory"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["process.working_directory"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["cwd"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["cwd"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["current_working_directory"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["current_working_directory"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.cwd"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.cwd"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.repository.root"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.repository.root"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.worktree.path"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.worktree.path"] != nil
+    metric_statements:
+      - context: resource
+        statements:
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.project.root"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.project.root"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.project.path"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.project.path"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["process.cwd"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["process.cwd"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["process.working_directory"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["process.working_directory"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["cwd"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["cwd"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["current_working_directory"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["current_working_directory"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.cwd"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.cwd"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.repository.root"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.repository.root"] != nil
+          - set(attributes["llm.observatory.project.id"], Concat(["local_sha256:", SHA256(attributes["llm.observatory.worktree.path"])], "")) where attributes["llm.observatory.project.id"] == nil and attributes["llm.observatory.worktree.path"] != nil
+  redaction/privacy:
+    allow_all_keys: false
+    # Fail closed at the first shared boundary. New provider fields must be
+    # reviewed and added here before they can reach a backend or normalizer.
+    # Raw roots/remotes and all content-shaped fields are intentionally absent.
+    allowed_keys:
+      - service.name
+      - service.version
+      - gen_ai.request.type
+      - gen_ai.request.effort
+      - gen_ai.response.finish_reasons
+      - gen_ai.provider.name
+      - gen_ai.system
+      - gen_ai.request.model
+      - gen_ai.response.model
+      - gen_ai.request.model.version
+      - gen_ai.response.model.version
+      - gen_ai.model.version
+      - gen_ai.operation.name
+      - gen_ai.tool.name
+      - gen_ai.tool.type
+      - gen_ai.conversation.id
+      - gen_ai.usage.input_tokens
+      - gen_ai.usage.output_tokens
+      - gen_ai.usage.cache_read.input_tokens
+      - gen_ai.usage.cache_creation.input_tokens
+      - gen_ai.usage.reasoning_tokens
+      - gen_ai.usage.total_tokens
+      - gen_ai.usage.cost
+      - gen_ai.client.latency_ms
+      - gen_ai.client.operation.duration
+      - gen_ai.time_to_first_token_ms
+      - session.id
+      # Claude Code emits these documented event dimensions as plain keys.
+      # Keep the list explicit; bodies, prompts, tool payloads, and errors
+      # remain excluded by the fail-closed policy below.
+      - event.name
+      - event.sequence
+      - model
+      - provider
+      - client
+      - session_id
+      - workflow_id
+      - input_tokens
+      - output_tokens
+      - cache_read_tokens
+      - cache_creation_tokens
+      - cost_usd
+      - cost_usd_micros
+      - duration_ms
+      - ttft_ms
+      - success
+      - status_code
+      - attempt
+      - query_source
+      - agent_id
+      - parent_agent_id
+      - workflow.run_id
+      - error.type
+      - error.kind
+      - error.code
+      - llm.observatory.evidence.source
+      - llm.observatory.acceptance.run_id
+      - llm.observatory.project.id
+      - llm.observatory.project.repository
+      - llm.observatory.project.branch
+      - llm.observatory.project.commit
+      - llm.observatory.provider
+      - llm.observatory.client
+      - llm.observatory.model.family
+      - llm.observatory.model.variant
+      - llm.observatory.operation.kind
+      - llm.observatory.auth.mode
+      - llm.observatory.route.kind
+      - llm.observatory.session.id
+      - llm.observatory.workflow.id
+      - llm.observatory.agent.id
+      - llm.observatory.subagent.id
+      - llm.observatory.parent.agent.id
+      - llm.observatory.role
+      - llm.observatory.skill
+      - llm.observatory.lane
+      - llm.observatory.task.id
+      - llm.observatory.task.class
+      - llm.observatory.context.size
+      - llm.observatory.context.utilization
+      - llm.observatory.compaction.count
+      - llm.observatory.latency_ms
+      - llm.observatory.time_to_first_token_ms
+      - llm.observatory.duration_ms
+      - llm.observatory.tool.duration_ms
+      - llm.observatory.session.duration_ms
+      - llm.observatory.agent.duration_ms
+      - llm.observatory.workflow.duration_ms
+      - llm.observatory.wall_clock_ms
+      - llm.observatory.concurrency
+      - llm.observatory.parallel_utilization
+      - llm.observatory.retry.count
+      - llm.observatory.agent.failure
+      - llm.observatory.aborted
+      - llm.observatory.reassessment.count
+      - llm.observatory.rework.count
+      - llm.observatory.tool.failure
+      - llm.observatory.error.kind
+      - llm.observatory.rate_limited
+      - llm.observatory.extensions
+      - llm.observatory.tool.call.count
+      - llm.observatory.tool.name
+      - llm.observatory.tool.names
+      - llm.observatory.files.inspected.count
+      - llm.observatory.files.changed.count
+      - llm.observatory.commands.executed.count
+      - llm.observatory.tests.invoked.count
+    blocked_key_patterns:
+      - "(?i)(^|.*[._-])(api[_-]?key|access[_-]?(key|key[_-]?id|token)|secret[_-]?access[_-]?key|subscription[_-]?key|security[_-]?token|refresh[_-]?token|session[_-]?token|id[_-]?token|authorization|auth[._-]?(token|header|value)|secret|password|private[_-]?key|credentials?|bearer|prompt(s)?|completion(s)?|completion[_-]?text|response[_-]?text|generated[_-]?text|input[._-]?(text|messages?)|output[._-]?(text|messages?)|tool[._-]?(call[._-]?)?(arguments?|input|output|result)|content|request[._-]?body|response[._-]?body|raw[._-]?(prompt|completion|body))([._-]|$)"
+      - "(?i)(auth[_-]?token|client[_-]?secret|prompt[_-]?text|tool[_-]?arguments?|.*sensitive.*|.*private.*)"
+      - "(?i)(^|.*[._-])(process[._-]?(environment|env)|user[._-]?(email|id|name)|environment|email)([._-]|$)"
+    blocked_values:
+      - "(?i)\\b(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{4,}"
+      - "(?i)\\b(sk|xai|gsk)-[A-Za-z0-9_-]{8,}"
+      - "(?i)\\bAIza[A-Za-z0-9_-]{16,}"
+      - "\\b(AKIA|ASIA)[0-9A-Z]{16}\\b"
+      - "(?i)(api[_-]?key|access[_-]?key([_-]?id)?|secret[_-]?access[_-]?key|subscription[_-]?key|token|password)\\s*[=:]\\s*[A-Za-z0-9._~+/=-]{8,}"
+    redact_all_types: true
+    summary: silent
   resource/observatory:
     attributes:
       - action: upsert
@@ -82,6 +246,10 @@ processors:
       - key: llm.observatory.repository.root
         action: delete
       - key: llm.observatory.worktree.path
+        action: delete
+      - key: process.cwd
+        action: delete
+      - key: process.working_directory
         action: delete
       - key: cwd
         action: delete
@@ -189,6 +357,10 @@ processors:
         action: delete
       - key: llm.observatory.worktree.path
         action: delete
+      - key: process.cwd
+        action: delete
+      - key: process.working_directory
+        action: delete
       - key: cwd
         action: delete
       - key: current_working_directory
@@ -238,6 +410,7 @@ exporters:
       storage: file_storage
       num_consumers: 2
       queue_size: 1024
+      block_on_overflow: false
     retry_on_failure:
       enabled: true
       max_elapsed_time: 30s
@@ -247,6 +420,7 @@ exporters:
       enabled: true
       storage: file_storage
       queue_size: 512
+      block_on_overflow: false
     retry_on_failure:
       enabled: true
       max_elapsed_time: 30s
@@ -258,6 +432,7 @@ exporters:
       enabled: true
       storage: file_storage
       queue_size: 1024
+      block_on_overflow: false
     retry_on_failure:
       enabled: true
       max_elapsed_time: 30s
@@ -265,17 +440,26 @@ exporters:
     endpoint: 0.0.0.0:8889
 
 service:
+  telemetry:
+    metrics:
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
   extensions: [health_check, file_storage]
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, resource/observatory, resource/privacy, attributes/privacy, transform/privacy, batch]
+      processors: [memory_limiter, transform/project_identity, redaction/privacy, resource/observatory, resource/privacy, attributes/privacy, transform/privacy, batch]
       exporters: [otlp/tempo, otlphttp/normalizer]
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, resource/observatory, resource/privacy, attributes/privacy, batch]
+      processors: [memory_limiter, transform/project_identity, redaction/privacy, resource/observatory, resource/privacy, attributes/privacy, batch]
       exporters: [prometheus, otlphttp/normalizer]
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, resource/observatory, resource/privacy, attributes/privacy, transform/privacy, batch]
+      processors: [memory_limiter, transform/project_identity, redaction/privacy, resource/observatory, resource/privacy, attributes/privacy, transform/privacy, batch]
       exporters: [otlphttp/loki, otlphttp/normalizer]

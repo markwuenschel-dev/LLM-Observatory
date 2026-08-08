@@ -15,5 +15,4 @@ RUN python -m pip install --no-cache-dir . \
 USER observatory
 EXPOSE 8787
 
-CMD ["python", "-m", "observatory.cli", "--state-dir", "/var/lib/observatory", "run-api", "--host", "0.0.0.0", "--port", "8787"]
-
+CMD ["python", "-m", "observatory.cli", "--state-dir", "/var/lib/observatory", "run-api", "--host", "0.0.0.0", "--allow-remote", "--allow-insecure-remote", "--port", "8787"]

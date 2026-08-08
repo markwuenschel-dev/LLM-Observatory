@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sqlite3
 from typing import Any, Iterable, Mapping
 
 from .clock import utc_now
 from .contracts import ContractError, NormalizedEvent
-from .store import EventStore
+from .store import EventStore, StorageCapacityError
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,7 @@ class IntakeResult:
     duplicate: int = 0
     conflict: int = 0
     rejected: int = 0
+    unavailable: int = 0
     errors: tuple[str, ...] = ()
 
     def add(self, status: str, error: str | None = None) -> "IntakeResult":
@@ -24,9 +26,13 @@ class IntakeResult:
             "duplicate": self.duplicate,
             "conflict": self.conflict,
             "rejected": self.rejected,
+            "unavailable": self.unavailable,
             "errors": list(self.errors),
         }
-        if status in values and status != "errors":
+        if status == "unavailable":
+            values["unavailable"] += 1
+            values["rejected"] += 1
+        elif status in values and status != "errors":
             values[status] += 1
         if error:
             values["errors"].append(error)
@@ -38,6 +44,7 @@ class IntakeResult:
             "duplicate": self.duplicate,
             "conflict": self.conflict,
             "rejected": self.rejected,
+            "unavailable": self.unavailable,
             "errors": list(self.errors),
         }
 
@@ -63,7 +70,10 @@ class Intake:
             try:
                 event = NormalizedEvent.from_mapping(record, received_at=utc_now())
                 result = result.add(self.store.append(event).status)
+            except StorageCapacityError as exc:
+                result = result.add("unavailable", f"record {index}: {exc}")
+            except sqlite3.Error:
+                result = result.add("unavailable", f"record {index}: store unavailable")
             except (ContractError, ValueError) as exc:
                 result = result.add("rejected", f"record {index}: {exc}")
         return result
-

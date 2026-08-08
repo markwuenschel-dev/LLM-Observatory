@@ -2,12 +2,24 @@
   "annotations": {"list": []},
   "editable": false,
   "panels": [
-    {"type": "timeseries", "id": 1, "title": "Skill / role / lane volume", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(50, observatory_events_by_execution_total)", "legendFormat": "{{skill}} / {{role}} / {{lane}}", "refId": "A"}]},
-    {"type": "timeseries", "id": 2, "title": "Workflow volume", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(50, observatory_events_by_workflow_total)", "legendFormat": "{{workflow}}", "refId": "A"}]},
-    {"type": "timeseries", "id": 3, "title": "Agent volume", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(50, observatory_events_by_agent_total)", "legendFormat": "{{agent}}", "refId": "A"}]},
-    {"type": "text", "id": 4, "title": "Execution boundary", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}, "options": {"mode": "markdown", "content": "Execution identities are source-reported dimensions. Missing or provider-specific hierarchy remains `unknown`; this view does not infer parentage or claim that a skill caused an outcome. Prometheus values are current store snapshots; use API `start`/`end` filters for time-bounded analysis."}}
+    {"type": "timeseries", "id": 1, "title": "Skill / role / lane volume", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(50, observatory_events_by_execution_total{event_type=~\"$event_type\",project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",role=~\"$role\",skill=~\"$skill\",lane=~\"$lane\"})", "legendFormat": "{{project}} / {{skill}} / {{role}} / {{lane}}", "refId": "A"}]},
+    {"type": "timeseries", "id": 2, "title": "Workflow volume", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(50, observatory_events_by_workflow_total{event_type=~\"$event_type\",project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",workflow=~\"$workflow\"})", "legendFormat": "{{project}} / {{workflow}}", "refId": "A"}]},
+    {"type": "timeseries", "id": 3, "title": "Agent volume", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"expr": "topk(50, observatory_events_by_agent_total{event_type=~\"$event_type\",project=~\"$project\",repository=~\"$repository\",branch=~\"$branch\",agent=~\"$agent\",subagent=~\"$subagent\"})", "legendFormat": "{{project}} / {{agent}} / {{subagent}}", "refId": "A"}]},
+    {"type": "text", "id": 4, "title": "Execution boundary", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}, "options": {"mode": "markdown", "content": "Execution identities are source-reported dimensions. Missing or provider-specific hierarchy remains `unknown`; this view does not infer parentage or claim that a skill caused an outcome. Observatory Events values are event-time scoped; use API `start`/`end` filters for complete time-bounded analysis."}}
   ],
   "schemaVersion": 39,
+  "templating": {"list": [
+    {"name": "project", "label": "Project", "type": "query", "query": "label_values(observatory_events_by_context_total, project)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL PROJECTS", "value": "$__all"}},
+    {"name": "repository", "label": "Repository", "type": "query", "query": "label_values(observatory_events_by_context_total, repository)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "branch", "label": "Branch", "type": "query", "query": "label_values(observatory_events_by_context_total, branch)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "role", "label": "Agent role", "type": "query", "query": "label_values(observatory_events_by_context_total, role)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "skill", "label": "Skill", "type": "query", "query": "label_values(observatory_events_by_context_total, skill)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "lane", "label": "Lane", "type": "query", "query": "label_values(observatory_events_by_context_total, lane)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "workflow", "label": "Workflow", "type": "query", "query": "label_values(observatory_events_by_context_total, workflow)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "agent", "label": "Agent", "type": "query", "query": "label_values(observatory_events_by_context_total, agent)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "subagent", "label": "Subagent", "type": "query", "query": "label_values(observatory_events_by_context_total, subagent)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}},
+    {"name": "event_type", "label": "Event type", "type": "query", "query": "label_values(observatory_events_by_context_total, event_type)", "includeAll": true, "allValue": ".*", "current": {"text": "ALL", "value": "$__all"}}
+  ]},
   "tags": ["llm", "skills", "workflows", "agents"],
   "time": {"from": "now-24h", "to": "now"},
   "title": "Skills and Workflows",

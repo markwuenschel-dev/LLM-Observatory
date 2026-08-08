@@ -2,9 +2,10 @@
   "annotations": {"list": []},
   "editable": false,
   "panels": [
-    {"type": "traces", "id": 1, "title": "Session and trace timeline", "gridPos": {"h": 14, "w": 24, "x": 0, "y": 0}, "datasource": {"type": "tempo", "uid": "tempo"}, "targets": [{"queryType": "traceql", "query": "{}", "refId": "A"}]},
-    {"type": "text", "id": 2, "title": "Drill-down contract", "gridPos": {"h": 7, "w": 24, "x": 0, "y": 14}, "options": {"mode": "markdown", "content": "Use the event detail and attribution endpoints for exact `session_id`, `workflow_id`, `agent_id`, `subagent_id`, and parent-event relationships. Prometheus intentionally avoids unbounded session labels; Tempo is the timeline store and SQLite is the durable metadata index. Prometheus values are current store snapshots; use API `start`/`end` filters for time-bounded analysis."}}
+    {"type": "traces", "id": 1, "title": "Session and trace timeline", "gridPos": {"h": 14, "w": 24, "x": 0, "y": 0}, "datasource": {"type": "tempo", "uid": "tempo"}, "targets": [{"queryType": "traceql", "query": "{ span.llm.observatory.session.id =~ \"$session_id\" || span.session.id =~ \"$session_id\" || span.gen_ai.conversation.id =~ \"$session_id\" }", "refId": "A"}]},
+    {"type": "text", "id": 2, "title": "Drill-down contract", "gridPos": {"h": 7, "w": 24, "x": 0, "y": 14}, "options": {"mode": "markdown", "content": "Enter an exact `session_id` in the dashboard variable (or use `.*` for all sessions) to inspect the Tempo timeline. The query accepts Observatory, OTel `session.id`, and GenAI conversation attributes. Use the event detail and attribution endpoints for exact `workflow_id`, `agent_id`, `subagent_id`, and parent-event relationships. Prometheus intentionally avoids unbounded session labels; Tempo is the timeline store and SQLite is the durable metadata index. Observatory Events values are event-time scoped; use API `start`/`end` filters for complete time-bounded analysis."}}
   ],
+  "templating": {"list": [{"name": "session_id", "label": "Session ID (regex; .* = all)", "type": "textbox", "query": ".*", "current": {"text": ".*", "value": ".*"}}]},
   "schemaVersion": 39,
   "tags": ["llm", "sessions", "traces"],
   "time": {"from": "now-24h", "to": "now"},
