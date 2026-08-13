@@ -1,43 +1,97 @@
+<div align="center">
+
 # LLM Observatory
 
-[![Python 3.14+](https://img.shields.io/badge/python-3.14%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/downloads/)
-[![uv / uvx](https://img.shields.io/badge/uv%20%2F%20uvx-latest-6E56CF?style=for-the-badge&logo=astral&logoColor=white)](https://docs.astral.sh/uv/)
-[![pnpm](https://img.shields.io/badge/pnpm-11%2B-F69220?style=for-the-badge&logo=pnpm&logoColor=white)](https://pnpm.io/)
-[![Docker Desktop](https://img.shields.io/badge/Docker%20Desktop-Linux%20containers-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com/products/docker-desktop/)
-[![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-OTLP-F5A800?style=for-the-badge&logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
-[![Grafana](https://img.shields.io/badge/Grafana-dashboards-F46800?style=for-the-badge&logo=grafana&logoColor=white)](https://grafana.com/)
-[![Tests](https://img.shields.io/badge/tests-190%20passing-2EA44F?style=for-the-badge)](tests/)
-[![Last commit](https://img.shields.io/github/last-commit/markwuenschel-dev/LLM-Observatory?style=for-the-badge)](https://github.com/markwuenschel-dev/LLM-Observatory/commits/main)
+<p><strong>Metadata-first observability for LLM-assisted development.</strong></p>
 
-Provider-agnostic, metadata-first observability for LLM-assisted development.
+<p>
+  See models, sessions, projects, agents, workflows, outcomes, cost, latency, and reliability<br />
+  without turning the Observatory into an inference proxy, credential store, or provider gateway.
+</p>
 
-LLM Observatory watches client activity externally and sends bounded telemetry to an OpenTelemetry Collector, normalized SQLite projections, Prometheus, Tempo, Loki, and Grafana. Normal inference stays on its existing provider path: the Observatory is not an inference proxy, credential store, or provider gateway.
+<p>
+  <a href="https://github.com/markwuenschel-dev/LLM-Observatory"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-3776AB?style=for-the-badge&logo=python&logoColor=white"></a>
+  <a href="pyproject.toml"><img alt="Package version 0.1.0" src="https://img.shields.io/badge/package-0.1.0-6E56CF?style=for-the-badge"></a>
+  <a href="tests/"><img alt="198 tests passing" src="https://img.shields.io/badge/tests-198%20passing-2EA44F?style=for-the-badge"></a>
+  <a href="https://github.com/markwuenschel-dev/LLM-Observatory/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/markwuenschel-dev/LLM-Observatory?style=for-the-badge"></a>
+</p>
 
-## Why this exists
+<p>
+  <a href="https://opentelemetry.io/"><img alt="OpenTelemetry OTLP" src="https://img.shields.io/badge/OpenTelemetry-OTLP-F5A800?style=flat-square&logo=opentelemetry&logoColor=white"></a>
+  <a href="https://docs.docker.com/compose/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&logo=docker&logoColor=white"></a>
+  <a href="https://www.sqlite.org/wal.html"><img alt="SQLite WAL" src="https://img.shields.io/badge/SQLite-WAL-003B57?style=flat-square&logo=sqlite&logoColor=white"></a>
+  <a href="https://prometheus.io/"><img alt="Prometheus" src="https://img.shields.io/badge/Prometheus-metrics-E6522C?style=flat-square&logo=prometheus&logoColor=white"></a>
+  <a href="https://grafana.com/oss/tempo/"><img alt="Grafana Tempo" src="https://img.shields.io/badge/Tempo-traces-F46800?style=flat-square&logo=grafana&logoColor=white"></a>
+  <a href="https://grafana.com/oss/loki/"><img alt="Grafana Loki" src="https://img.shields.io/badge/Loki-logs-F46800?style=flat-square&logo=grafana&logoColor=white"></a>
+  <a href="https://grafana.com/"><img alt="Grafana dashboards" src="https://img.shields.io/badge/Grafana-dashboards-F46800?style=flat-square&logo=grafana&logoColor=white"></a>
+  <a href="docs/privacy.md"><img alt="Metadata first privacy boundary" src="https://img.shields.io/badge/privacy-metadata--first-0F766E?style=flat-square"></a>
+  <a href="docs/architecture.md"><img alt="Inference path remains untouched" src="https://img.shields.io/badge/inference-path%20untouched-7C3AED?style=flat-square"></a>
+</p>
 
-- Compare models, sessions, projects, outcomes, skills, workflows, and agent hierarchies.
-- Correlate usage, latency, cost, reliability dimensions, tests, builds, commits, and reviews without claiming causation.
-- Keep prompts, completions, secrets, sensitive tool values, and raw filesystem paths out of the default persistence path.
-- Continue client inference when telemetry, dashboards, storage, or the bounded Collector queue is degraded.
+<p>
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#connect-your-clients">Connect clients</a> ·
+  <a href="docs/operations.md">Operations</a> ·
+  <a href="docs/production-readiness.md">Readiness</a>
+</p>
+
+</div>
+
+> LLM Observatory is an external observation plane for AI-assisted engineering. It collects bounded, privacy-safe metadata from existing client paths and makes it queryable locally. Normal inference continues through the provider and client route it already uses.
+
+## At a glance
+
+| Observe | Keep out by default | Never change |
+| --- | --- | --- |
+| Provider and model identity, project and branch, sessions and traces, agents and workflows, usage, latency, reliability, and explicit engineering outcomes | Prompts, completions, secrets, credentials, raw filesystem paths, sensitive tool values, and raw activity payloads | Provider URLs, credentials, request payloads, inference routing, and client exit paths |
+
+## Architecture
+
+The core invariant is simple: telemetry is asynchronous, bounded, and disposable from the point of view of inference.
+
+```mermaid
+flowchart LR
+    C["Existing client / provider path"]
+    H["Metadata-only hook or OTLP"]
+    O["Host Observatory<br/>control :8787<br/>read :8788"]
+    X["OpenTelemetry<br/>Collector"]
+    D[("SQLite WAL")]
+    P["Prometheus"]
+    T["Tempo"]
+    L["Loki"]
+    G["Grafana"]
+
+    C --> H
+    H -. "async, bounded" .-> O
+    O --> D
+    O --> X
+    X --> P
+    X --> T
+    X --> L
+    D --> O
+    P --> G
+    T --> G
+    L --> G
+    O -. "degraded telemetry never blocks inference" .-> C
+```
+
+The host-native API keeps control and intake on `8787`, while bounded dashboard reads use `8788`. Docker reaches those endpoints through `host.docker.internal`; generated API and Grafana secrets live under the user state directory, never in an observed repository.
+
+## Why it exists
+
+- Compare model, provider, client, project, session, workflow, skill, and agent behavior in one local view.
+- Correlate usage, latency, cost, reliability, tests, builds, commits, and reviews without claiming causation.
 - Start with synthetic metadata, then add explicitly authorized native client telemetry.
-
-## Stack
-
-| Layer | Technology |
-| --- | --- |
-| Runtime | Python 3.14+ recommended; package metadata remains compatible with Python 3.11+ |
-| Fast tooling | [uv](https://docs.astral.sh/uv/) and [uvx](https://docs.astral.sh/uv/guides/tools/) |
-| Optional JavaScript tooling | Node.js current/LTS plus [pnpm](https://pnpm.io/) 11+ |
-| Telemetry | OpenTelemetry Protocol (OTLP) and Collector |
-| Storage | SQLite WAL, Prometheus, Tempo, Loki |
-| Dashboards | Grafana |
-| Local orchestration | Docker Desktop in Linux-container/WSL2 mode |
+- Keep observability failure isolated: a full queue, unavailable Collector, degraded store, or unavailable dashboard must not redirect inference.
 
 ## Quick start
 
+The provider-free demo seeds synthetic metadata and is safe to run before connecting a real client.
+
 ### Windows PowerShell
 
-Install the current Python 3.14+ and Docker Desktop, then run the CLI directly from the checkout with `uvx`:
+Install Python 3.14+ and Docker Desktop in Linux-container/WSL2 mode, then run from the checkout:
 
 ```powershell
 cd C:\Users\Nalakram\Documents\GitHub\LLM-Observatory
@@ -49,9 +103,19 @@ uvx --python 3.14 --from . observatory --state-dir $state start
 uvx --python 3.14 --from . observatory open
 ```
 
-The explicit `install --demo` walkthrough is provider-free, metadata-only, and idempotent. Omit `--demo` when the state must contain only real telemetry. The generated state directory contains the SQLite database, bounded spool, Compose environment, and Grafana secret; it is never created inside an observed repository.
+Open the local surfaces:
 
-For a normal editable development environment:
+| Surface | URL |
+| --- | --- |
+| Grafana | [127.0.0.1:3000](http://127.0.0.1:3000) |
+| Control API health | [127.0.0.1:8787/healthz](http://127.0.0.1:8787/healthz) |
+| Read API readiness | [127.0.0.1:8788/readz](http://127.0.0.1:8788/readz) |
+| OTLP gRPC / HTTP | `127.0.0.1:4317` / `127.0.0.1:4318` |
+| Collector health | `127.0.0.1:13133` |
+
+The generated state directory contains the host-native SQLite database, bounded spool, Compose environment, Grafana secret, and API bearer-token files. It is never created inside an observed repository.
+
+### Editable development install
 
 ```powershell
 $state = "$env:LOCALAPPDATA\LLM-Observatory"
@@ -62,30 +126,9 @@ uv pip install -e .
 observatory --state-dir $state install
 ```
 
-Docker Desktop must be running in Linux-container/WSL2 mode before `start`. Default host bindings are loopback-only:
+## Send a first event set
 
-- Grafana: [http://127.0.0.1:3000](http://127.0.0.1:3000)
-- API health: [http://127.0.0.1:8787/healthz](http://127.0.0.1:8787/healthz)
-- OTLP gRPC: `127.0.0.1:4317`
-- OTLP HTTP: `127.0.0.1:4318`
-- Collector health: `127.0.0.1:13133`
-
-### Recovering stale Compose state
-
-If `doctor` reports that the live `llm-observatory` project references stale generated state, stop retrying `start`. Reconcile only that project, preserving its named volumes and host state:
-
-```powershell
-$state = "$env:LOCALAPPDATA\LLM-Observatory"
-observatory --state-dir $state install
-docker compose --project-name llm-observatory `
-  --env-file "$state\compose.env" down --remove-orphans
-observatory --state-dir $state start
-observatory --state-dir $state doctor
-```
-
-Do not add `-v`: removing volumes deletes durable telemetry and dashboard data. The command above removes only the stale project containers and network so Compose can recreate them against the installed state.
-
-## Ingest a first event set
+Use the checked-in synthetic fixture to exercise ingestion without provider credentials:
 
 ```powershell
 uvx --python 3.14 --from . observatory --state-dir $state ingest `
@@ -96,21 +139,16 @@ uvx --python 3.14 --from . observatory --state-dir $state status
 
 JSONL records require `schema_version`, `event_id`, `event_type`, and a timezone-aware `observed_at`. Unknown provider and model values are valid. The default path redacts sensitive fields before persistence and API delivery.
 
-## Optional pnpm / JavaScript tooling
+## Connect your clients
 
-This repository has no JavaScript application or `package.json`; pnpm is an optional, forward-looking toolchain for dashboard extensions or a future web UI. Install the current pnpm release with Node.js available:
+The Observatory does not replace a client’s subscription or API path. Configure only the client-level telemetry surface you have explicitly reviewed.
 
-```powershell
-npm install --global pnpm@latest
-pnpm --version
-pnpm self-update
-```
-
-Do not install pnpm as a prerequisite for the Python Observatory CLI.
-
-## Always-on client telemetry
-
-Configure the user-level clients once. Their normal subscription/API inference path stays unchanged; Observatory receives metadata only, with prompt/tool content disabled:
+| Client surface | Current posture |
+| --- | --- |
+| Claude Code, Codex, Gemini | Documented global OTLP settings; opt-in configuration |
+| Kimi, Grok | Marked global observation hooks through the fail-open adapter |
+| Cursor | Adapter-only until a verified global hook or OTLP contract exists |
+| Direct APIs and OpenRouter | Caller-owned response adapters; no mandatory proxy |
 
 ```powershell
 uvx --python 3.14 --from . observatory --state-dir $state configure claude --apply --traces
@@ -120,21 +158,9 @@ uvx --python 3.14 --from . observatory --state-dir $state configure kimi --apply
 uvx --python 3.14 --from . observatory --state-dir $state configure grok --apply
 ```
 
-Claude Code, Codex, and Gemini use their documented global OTLP settings. Kimi and Grok use marked global observation hooks that call the fail-open `observatory hook` adapter. The hook resolves the current working directory to a privacy-safe project identity, so a new Git repository appears automatically without repository files, dependencies, or hooks. If the Collector or API is unavailable, the hook spools bounded metadata or drops it; it never blocks inference. Cursor remains adapter-only until a verified global hook/OTLP contract exists.
+Review a plan without changing user files by omitting `--apply`. A real-client acceptance run requires an operator-authorized client command; the harness never runs a provider command automatically.
 
-Review a plan without changing user files by omitting `--apply`. The Observatory never sets provider base URLs, proxy variables, credentials, or repository files. A real-client acceptance run requires an explicit operator-authorized client command:
-
-```powershell
-pwsh -NoProfile -File .\scripts\provider-acceptance.ps1 `
-  -Client claude `
-  -ClientCommand claude,"--print","<operator-authorized acceptance prompt>"
-```
-
-The harness is plan-only and credential-free by default. It uses an isolated Compose project, requires attributable new telemetry, checks repository privacy through hashes, and never runs a provider command automatically.
-
-## Operational commands
-
-The commands below assume the editable environment is active. Otherwise use the `uvx --python 3.14 --from . observatory` form from Quick start.
+## Operate it safely
 
 ```powershell
 observatory --state-dir $state status
@@ -145,44 +171,30 @@ observatory --state-dir $state run-outcome --kind tests --offline -- python -m u
 observatory --state-dir $state stop
 ```
 
-Do not use `docker compose down -v` during normal operation. Use the explicit audited `prune --confirm` path for normalized-event deletion. Encrypt backup archives before storing them outside the host.
+Do not use `docker compose down -v` during normal operation: it deletes durable telemetry and dashboard volumes. For stale generated Compose state, use the audited recovery sequence in [Operations and recovery](docs/operations.md).
 
-## Architecture invariant
-
-```text
-normal LLM inference -> normal provider/client path
-                         \
-                          async bounded telemetry -> OTel Collector -> stores -> Grafana
-```
-
-Collector, storage, Grafana, malformed events, and telemetry queue saturation may degrade observability but must not block or redirect inference.
-
-## Verification
+## Verify the repository
 
 ```powershell
 $env:PYTHONPATH = 'src'
 python -m unittest discover -s tests -p "test_*.py"
 python scripts/verify.py
 docker compose --env-file "$env:LOCALAPPDATA\LLM-Observatory\compose.env" config
-
-# Requires Docker Desktop; runs the isolated full runtime gate.
-pwsh -NoProfile -File .\scripts\runtime-acceptance.ps1
-
-# Isolated exporter backpressure proof.
-pwsh -NoProfile -File .\scripts\queue-saturation-acceptance.ps1
 ```
 
-The local unit suite currently reports 190 passing tests and the static verifier reports no failures. Runtime acceptance proves service, query, privacy, recovery, and failure-isolation behavior; it does not replace a real-client telemetry run, a human dashboard visual sweep, off-host encrypted recovery, host reboot proof, or signed-image promotion.
+The local unit suite currently reports 198 passing tests and the static verifier reports no failures. The disposable runtime gate covers service startup, query, privacy, recovery, and failure isolation; it does not replace a real-client telemetry run, human dashboard review, off-host encrypted recovery, host reboot proof, or signed-image promotion.
 
 ## Documentation
 
-- [Operations and recovery](docs/operations.md)
-- [Architecture](docs/architecture.md)
-- [Privacy boundary](docs/privacy.md)
-- [Capability evidence](docs/capability-evidence.md)
-- [Production readiness](docs/production-readiness.md)
-- [Superpowers implementation plan](docs/superpowers/plans/2026-08-07-llm-observatory-foundation.md)
+| Guide | Use it for |
+| --- | --- |
+| [Architecture](docs/architecture.md) | Durable invariants, signal roles, attribution, and known limits |
+| [Operations and recovery](docs/operations.md) | Install, lifecycle, retention, backups, upgrades, and failure isolation |
+| [Privacy boundary](docs/privacy.md) | Default redaction, allowlists, pseudonymous project identity, and content-capture rules |
+| [Capability evidence](docs/capability-evidence.md) | Client-specific telemetry evidence and adapter posture |
+| [Production readiness](docs/production-readiness.md) | Remaining deployment and promotion gates |
+| [Foundation plan](docs/superpowers/plans/2026-08-07-llm-observatory-foundation.md) | The current implementation plan and design record |
 
-## License and status
+## Status
 
-The repository does not currently declare a license file. Treat this as an active, production-oriented foundation with explicit remaining deployment gates—not as a completed production sign-off.
+This is an active, production-oriented foundation. The repository does not currently declare a license file, and production sign-off remains gated on the explicit evidence listed in [Production readiness](docs/production-readiness.md).
