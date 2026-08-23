@@ -33,7 +33,14 @@ class ClientAndOutcomeTests(unittest.TestCase):
             state.mkdir()
             (state / "config.json").write_text(json.dumps({"schema_version": "1.0", "managed_clients": {}}), encoding="utf-8")
             args = build_parser().parse_args(["--state-dir", str(state), "uninstall", "--apply", "--delete-state"])
-            with patch("observatory.cli._compose", return_value=(0, "stopped")):
+            # `uninstall` probes the real loopback control plane and refuses to
+            # terminate an API this state directory does not own. Without this
+            # patch the test only passes on a host where Observatory is *not*
+            # running, which inverts the intended signal.
+            with patch("observatory.cli._compose", return_value=(0, "stopped")), patch(
+                "observatory.cli._stop_host_api",
+                return_value=(True, "host API not managed by this state directory"),
+            ):
                 result = _command_uninstall(args)
             self.assertEqual(result["outcome"], "success")
             self.assertEqual(result["data"]["state"], "deleted")
@@ -546,6 +553,83 @@ class ClientAndOutcomeTests(unittest.TestCase):
                 self.assertNotIn("RUN_OUTCOME_CANARY", event.to_json())
                 self.assertEqual(event.attributes.get("command_name"), Path(sys.executable).name)
                 self.assertEqual(event.attributes.get("command_arg_count"), 2)
+
+
+class OutcomeIdentityTests(unittest.TestCase):
+    """Collection-time state must not become part of what an outcome IS.
+
+    The stable event id is derived from the payload, and `worktree` is a hash of
+    the checkout path. `git worktree list` reports two worktrees for this
+    repository, and `collect-outcomes` scans every discovered project root, so
+    one landed commit collected twice produced two events identical in
+    project_id, repository and commit -- double-counted, and indistinguishable
+    in every dimension a dashboard can group by.
+    """
+
+    def _project(self, **overrides):
+        from dataclasses import replace
+
+        from observatory.contracts import ProjectIdentity
+
+        base = ProjectIdentity(
+            project_id="repo_sha256:abc", repository="demo",
+            branch="main", worktree="worktree-a", commit="deadbeefcafe",
+        )
+        return replace(base, **overrides)
+
+    def _commit_event(self, **overrides):
+        return make_outcome_event(
+            "commit", "landed",
+            project=self._project(**overrides),
+            observed_at="2026-08-20T10:00:00+00:00",
+            volatile_project_fields=("worktree",),
+        )
+
+    def test_one_commit_collected_from_two_worktrees_is_one_event(self):
+        self.assertEqual(
+            self._commit_event().event_id,
+            self._commit_event(worktree="worktree-b").event_id,
+            "the checkout path still decides the identity of a landed commit",
+        )
+
+    def test_the_worktree_is_still_recorded_as_evidence(self):
+        # Neutralized for identity only. Dropping it from the envelope would
+        # discard real provenance rather than stabilise the id.
+        self.assertEqual(self._commit_event(worktree="worktree-b").project.worktree, "worktree-b")
+
+    def test_genuinely_different_commits_stay_distinct(self):
+        self.assertNotEqual(
+            self._commit_event().event_id,
+            self._commit_event(commit="0123456789ab").event_id,
+        )
+
+    def test_a_different_repository_stays_distinct(self):
+        self.assertNotEqual(
+            self._commit_event().event_id,
+            self._commit_event(repository="other").event_id,
+        )
+
+    def test_callers_that_declare_nothing_volatile_are_unaffected(self):
+        # The parameter must be opt-in: every other outcome producer keeps the
+        # identity it had.
+        first = make_outcome_event("tests", "passed", project=self._project(),
+                                   observed_at="2026-08-20T10:00:00+00:00")
+        second = make_outcome_event("tests", "passed", project=self._project(worktree="worktree-b"),
+                                    observed_at="2026-08-20T10:00:00+00:00")
+        self.assertNotEqual(first.event_id, second.event_id)
+
+    def test_ci_runs_carry_their_real_branch(self):
+        # A commit is not owned by whatever branch is checked out when it is
+        # collected, so commit events carry no branch. A CI run genuinely has
+        # one, it is immutable for that run, and GitHub reports it -- so the
+        # `?branch=` filter can answer honestly for CI.
+        import inspect
+
+        from observatory import outcomes
+
+        source = inspect.getsource(outcomes.ci_run_outcomes)
+        self.assertIn("headBranch", source, "the CI collector does not request the run's branch")
+        self.assertIn("branch=head_branch", source, "the CI collector does not record the run's branch")
 
 
 if __name__ == "__main__":

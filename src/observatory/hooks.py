@@ -126,6 +126,49 @@ def _error_reported(payload: Mapping[str, Any]) -> bool:
     return False
 
 
+# Tools whose invocation names a reusable capability rather than an action.
+_SKILL_TOOLS = frozenset({"skill", "skills"})
+_WORKFLOW_TOOLS = frozenset({"workflow", "workflows"})
+# A capability identifier, not a sentence.
+MAX_CAPABILITY_NAME = 120
+
+
+def _invoked_capability(payload: Mapping[str, Any], tool_name: str | None) -> tuple[str | None, str | None]:
+    """Name the skill or workflow a tool call invoked, if it named one.
+
+    Which skill or workflow ran is the dimension the comparison surface needs,
+    and it is the one no client reports natively -- the identifier is present in
+    the hook payload but was previously kept only as a tool attribute, so those
+    comparisons could never be populated. Only the identifier is read: the rest
+    of the tool input is arguments, which the privacy boundary excludes.
+    """
+
+    if not tool_name:
+        return None, None
+    key = tool_name.casefold()
+    if key not in _SKILL_TOOLS and key not in _WORKFLOW_TOOLS:
+        return None, None
+    tool_input = _first(payload, ("tool_input", "toolInput", "input", "arguments"))
+    if not isinstance(tool_input, Mapping):
+        return None, None
+    raw = _first(tool_input, ("skill", "workflow", "name", "skill_name", "workflow_name"))
+    if not isinstance(raw, str):
+        return None, None
+    # Check the RAW value, before `_label` normalises it: `_label` turns spaces
+    # into underscores, so a sentence passed as `name` would sail through a
+    # whitespace check applied afterwards and land verbatim in an indexed column
+    # and a GROUP BY dimension. These keys are read out of tool input, which is
+    # otherwise excluded entirely, so the bar is "looks like an identifier".
+    if len(raw) > MAX_CAPABILITY_NAME or any(ch.isspace() for ch in raw):
+        return None, None
+    identifier = _label(raw)
+    if not identifier:
+        return None, None
+    if key in _SKILL_TOOLS:
+        return identifier, None
+    return None, identifier
+
+
 def build_hook_event(
     client: str,
     payload: Mapping[str, Any],
@@ -147,6 +190,7 @@ def build_hook_event(
     model = _label(_first(payload, ("model", "model_name", "modelName"))) or "unknown"
     tool_name = _label(_first(payload, ("tool_name", "toolName", "tool")))
     notification_type = _label(_first(payload, ("notification_type", "notificationType")))
+    skill, workflow = _invoked_capability(payload, tool_name)
     auth_mode = _label(_first(payload, ("auth_mode", "authMode"))) or "unknown"
     route = _label(_first(payload, ("route", "gateway"))) or "unknown"
     error = _error_reported(payload)
@@ -185,6 +229,8 @@ def build_hook_event(
             "session_id": session_id,
             "agent_id": agent_id,
             "subagent_id": subagent_id,
+            "skill": skill,
+            "workflow_id": workflow,
         },
         "llm": {
             "provider": provider,
@@ -224,6 +270,14 @@ def build_hook_event(
         "outcome": {
             "kind": "client-hook",
             "status": event_name,
+            # A hook event without a correlation basis is unjoinable: the store
+            # only builds an attribution edge when it is told which shared
+            # identifier to match on. The session is the defensible one here --
+            # the hook and the client's own telemetry report the same session id
+            # -- so declaring it turns lifecycle events into evidence that can be
+            # associated with the LLM activity of that session.
+            "correlation_id": session_id,
+            "correlation_basis": "session_id" if session_id else None,
             "evidence_source": "client-hook",
         },
         "provenance": {

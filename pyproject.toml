@@ -22,4 +22,7 @@ observatory = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Ensure the working tree under src/ is what tests import, never a stale
+# non-editable copy in site-packages.
+pythonpath = ["src"]
 

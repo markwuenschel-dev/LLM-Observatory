@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> **Current execution status (2026-08-08):** Tasks 1–8 below are implemented in the current working tree. Their focused commands and the full suite are green; the disposable Docker, queue-saturation, and independent seam checks are recorded in [`docs/production-readiness.md`](../../production-readiness.md). The remaining open *release* boundaries are external: a post-fix real-client emission, a stable-state host reboot, a human visual sweep, off-host encrypted recovery, and signed image promotion. Historical “initial failure” wording is retained only as context and does not describe the current checkout.
+> **Current execution status (updated 2026-08-21):** Tasks 1–8 below are implemented in the current working tree. Their focused commands and the full suite are green (unit suite 210 passed; `python scripts/verify.py` returns `{"failures": [], "status": "pass"}`). The disposable Docker, queue-saturation, and independent seam checks are recorded in [`docs/production-readiness.md`](../../production-readiness.md). **The disposable Docker gate last passed on 2026-08-08 against the pre-split architecture, where the API was a Compose service at `observatory-api:8787`; the host-native control/read split invalidated that evidence for API-traversing paths and the gate has not been rerun.** The remaining open *release* boundaries are external: a post-fix real-client emission, a stable-state host reboot, a human visual sweep, off-host encrypted recovery, and signed image promotion. Historical “initial failure” wording is retained only as context and does not describe the current checkout.
 
 **Goal:** Build the first production-useful vertical slice of a provider-agnostic LLM Observatory: metadata-first event intake, explicit provenance and privacy contracts, automatic Git project attribution, a durable local store, an out-of-band OTel/Grafana deployment, and a diagnostic CLI.
 
-**Architecture:** A host-side Python package owns normalized event contracts, redaction, project resolution, SQLite persistence, and the `observatory` CLI. Native client telemetry is optional and goes to a localhost-only OpenTelemetry Collector; the Collector exports traces and metrics to Grafana-compatible backends without entering an inference path. A Docker Compose stack provides the Collector, Tempo, Prometheus, Grafana, and the host API as independently restartable services. Provider/client adapters are capability-declared and may emit partial metadata; they must never invent authoritative usage or require repository files.
+**Architecture:** A host-side Python package owns normalized event contracts, redaction, project resolution, SQLite persistence, and the `observatory` CLI. Native client telemetry is optional and goes to a localhost-only OpenTelemetry Collector; the Collector exports traces and metrics to Grafana-compatible backends without entering an inference path. Docker Compose provides the Collector, Tempo, Prometheus, and Grafana; the host-native API owns the canonical SQLite path and exposes separate control/intake and bounded dashboard-read planes. Containers bridge to those planes through `host.docker.internal` with generated bearer-token secrets. Provider/client adapters are capability-declared and may emit partial metadata; they must never invent authoritative usage or require repository files.
 
 **Tech Stack:** Python 3.11+, standard-library HTTP/SQLite/argparse, OpenTelemetry Collector Contrib, Grafana, Tempo, Prometheus, Docker Compose, JSON Lines, JSON Schema-shaped versioned envelopes, and unittest-compatible tests.
 
@@ -33,10 +33,10 @@
 | Area | Current status | Classification | Canonical owner | Evidence | Known gap | Next relevant action |
 |---|---|---|---|---|---|---|
 | Repository | Dirty working tree over the initial commit; implementation, tests, dashboards, deployment, and scripts are present but not committed | Verified locally | This working tree | `git status --short`, `git log -1 --oneline` | Changes still require an intentional review/commit boundary | Review the diff, then commit only when the owner requests it |
-| Host | Windows; Python 3.14.x; Docker Engine 29.6.2 is available to the runtime gate | Verified locally | Host environment | Runtime acceptance output and local version probes | Docker Desktop/host reboot and off-host recovery remain operator gates | Run the documented host-reboot and recovery checks |
+| Host | Windows; Python 3.14.x; Docker Engine 29.6.2 is available to the runtime gate | Verified locally | Host environment | Local version probes, plus 2026-08-08 pre-split runtime acceptance output | Docker Desktop/host reboot and off-host recovery remain operator gates; the runtime gate itself awaits a post-split rerun | Rerun the disposable runtime gate, then run the documented host-reboot and recovery checks |
 | Installed clients | Claude Code 2.1.226, Codex executable present but blocked by local access policy, Cursor 3.14.27, Kimi 0.28.1, and Grok 0.2.118; Gemini/OpenRouter CLIs absent | Verified locally / blocked | Capability registry | Capability matrix, bounded `--version` probes, and `doctor` | Real provider emission and subscription-mode behavior remain unverified | Run the explicit operator-authorized provider acceptance harness |
-| Telemetry foundation | OTel Collector, host normalizer, SQLite ledger, Tempo, Loki, Prometheus, and Grafana are implemented with bounded queues, privacy allowlists, and restart-durable volumes | Verified locally and in disposable runtime | OTel Collector configuration and normalized contract | Full test suite, `scripts/verify.py`, and `scripts/runtime-acceptance.ps1` | Immutable image promotion and host-loss recovery remain external gates | Record approved image digests and rehearse off-host restore |
-| Visualization | Ten provisioned Grafana dashboards execute their metric/log/trace targets and event-time queries in the disposable runtime gate | Query/runtime verified; visual review pending | Provisioned Grafana/Tempo files | Runtime dashboard sweep and `docs/production-readiness.md` | Human visual usability review is not automated | Perform the documented visual sweep before production sign-off |
+| Telemetry foundation | OTel Collector, host normalizer, SQLite ledger, Tempo, Loki, Prometheus, and Grafana are implemented with bounded queues, privacy allowlists, and restart-durable volumes | Verified locally; the disposable runtime half is pre-split (2026-08-08) and awaits a rerun | OTel Collector configuration and normalized contract | Full test suite, `scripts/verify.py`, and `scripts/runtime-acceptance.ps1` | Immutable image promotion and host-loss recovery remain external gates | Record approved image digests and rehearse off-host restore |
+| Visualization | Ten provisioned Grafana dashboards executed their metric/log/trace targets and event-time queries in the 2026-08-08 disposable runtime gate, against the pre-split combined-plane API | Pending re-verification; those queries now traverse the GET-only read plane on `8788`, and the provisioned datasource `httpMethod` was corrected from POST to GET in this change without a runtime rerun. Visual review also pending | Provisioned Grafana/Tempo files | Runtime dashboard sweep and `docs/production-readiness.md` | Human visual usability review is not automated | Perform the documented visual sweep before production sign-off |
 
 ## Facts, Assumptions, and Unknowns
 
@@ -46,7 +46,7 @@
 - **Assumption:** The first deployment is single-user, single-host, private, and local-network-only. The persistence interface remains replaceable for a later PostgreSQL or analytical backend.
 - **Assumption:** Native telemetry is unavailable or inconsistent for some subscription clients. The initial adapter contract therefore supports global logs/hooks/exports and explicitly represents missing fields.
 - **Fact:** Current first-party capability evidence and bounded local probes are recorded in `docs/capability-evidence.md` and `docs/capability-matrix.yaml`; unverified modes remain explicitly partial or unknown.
-- **Fact:** The pinned images and current disposable Compose profile pass the runtime gate; the stable host state after the recent reboot still requires an operator reinstall/restart check.
+- **Fact:** The pinned images and the pre-split disposable Compose profile passed the runtime gate on 2026-08-08. The host-native API split invalidated that run for every gate whose path traverses the API, and the gate has not been rerun, so a fresh disposable runtime gate is pending. The stable host state after the recent reboot still requires an operator reinstall/restart check.
 
 ## Source-of-Truth and Authority Map
 
@@ -67,7 +67,7 @@ client hook / native OTLP / adapter / explicit CLI event
         -> host-side redaction and envelope validation
         -> project identity resolution and provenance enrichment
         -> idempotent SQLite normalized store
-        -> local metrics endpoint and optional OTel export
+        -> host control/intake API plus bounded read/metrics API
         -> Prometheus / Tempo / Grafana
 ```
 
@@ -192,7 +192,7 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 
 **Interfaces:**
 - Produces `POST /v1/events` for one JSON envelope or a bounded JSON array; response includes inserted/duplicate/rejected counts.
-- Produces `GET /healthz`, `GET /readyz`, `GET /metrics`, and `GET /v1/summary`.
+- Produces `GET /healthz` and `GET /readyz` on the control/intake plane, and `GET /readz`, `GET /metrics`, `GET /v1/summary`, and the other bounded read endpoints on the dashboard-read plane. The two planes are split by `_plane_allows` (`src/observatory/api.py:830-848`): the control plane serves only `/healthz`, `/readyz`, and the POST intake endpoints, while the read plane is GET-only.
 - Produces OTLP/JSON-compatible `POST /v1/traces`, `/v1/metrics`, and `/v1/logs` normalization endpoints; the Collector supplies batching/retry and the API supplies redaction/idempotent storage.
 - CLI commands are `install`, `doctor`, `start`, `stop`, `status`, `configure`, `open`, `update`, `ingest`, `resolve-project`, and `run-api`.
 
@@ -201,7 +201,7 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 - [x] Implement the API with the standard-library HTTP server so the core can run before optional dependencies are installed; bind to loopback by default.
 - [x] Implement the OTLP JSON bridge for resource spans, logs, and metrics while preserving trace/span IDs, schema URLs, source identity, usage provenance, and metadata-only attributes.
 - [x] Implement `ingest` as asynchronous-tolerant: HTTP delivery is best effort, while offline JSONL spooling is the durable fallback and never invokes provider inference.
-- [x] Run `python -m unittest tests.test_api tests.test_cli -v`; the current focused run passed 41 tests.
+- [x] Run `python -m unittest tests.test_api tests.test_cli -v`; the current focused run passed 47 tests (`Ran 47 tests ... OK`, re-run 2026-08-21 with `PYTHONPATH=src`).
 
 ### Task 6: OTel Collector, Tempo, Prometheus, Grafana, and Compose deployment
 
@@ -217,7 +217,7 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 - Test: `tests/test_deployment.py`
 
 **Interfaces:**
-- Compose exposes only loopback ports by default: API `8787`, OTLP gRPC `4317`, OTLP HTTP `4318`, Grafana `3000`; internal services communicate on the Compose network.
+- Compose exposes only loopback ports by default: OTLP gRPC `4317`, OTLP HTTP `4318`, Collector health `13133`, and Grafana `3000` (`compose.yaml:21-24,129-130`); internal services communicate on the Compose network. Compose no longer publishes an API port — the API runs natively on the host and containers reach its control plane (`8787`) and read plane (`8788`) through `host.docker.internal` with generated bearer-token secrets.
 - Collector has `memory_limiter`, `batch`, bounded exporter queues, explicit health endpoint, and OTLP-to-Tempo plus Prometheus metrics export.
 - Collector exports JSON OTLP signals to the host normalizer as a bounded, queued secondary path while retaining Tempo/Loki/Prometheus fan-out.
 - Grafana provisions Prometheus and Tempo data sources and loads a global dashboard with evidence-quality labels.
@@ -227,7 +227,7 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 - [x] Implement the dashboard family with all-project defaults and variables for project, provider, model, client, route, agent role, workflow, branch, and status.
 - [x] Add a verification script that parses JSON and YAML-like required keys without requiring a running Docker daemon.
 - [x] Run `python -m unittest tests.test_deployment -v`; the current focused run passed 16 tests.
-- [x] The disposable runtime gate validated Compose normalization, startup, readiness, recovery, and dashboard provisioning; runtime startup remains separately recorded from static validation.
+- [x] The disposable runtime gate validated Compose normalization, startup, readiness, recovery, and dashboard provisioning on 2026-08-08, against the pre-split architecture in which the API was a Compose service. That runtime evidence was invalidated for API-traversing paths by the host-native control/read split and has not been rerun; runtime startup remains separately recorded from static validation.
 
 ### Task 7: Capability registry and adapter seams
 
@@ -261,7 +261,7 @@ The store accepts unknown `event_type`, provider, model, and extension keys. It 
 - [x] Add tests proving malformed telemetry, duplicate events, saturated offline spool limits, unknown provider/model/repository, and restart-safe migrations have explicit outcomes.
 - [x] Document the distinction between `inference healthy` and `telemetry degraded`, installation, diagnostics, retention, backup, deletion, and recovery.
 - [x] Run `python scripts/verify.py`; the current verifier returns zero failures.
-- [x] Run the full suite with `python -m unittest discover -s tests -v`; the current full-suite evidence is 187 passing tests.
+- [x] Run the full suite with `python -m unittest discover -s tests -v`; the current full-suite evidence is 198 passing tests.
 
 ## Parallel Execution Strategy
 
@@ -311,7 +311,7 @@ The definition above describes the code and validation plan, not unconditional p
 - **Implementation state:** Tasks 1–8 are implemented and their focused checks are green in the current working tree.
 - **Highest-leverage dependency:** the versioned `NormalizedEvent` plus privacy/provenance contract remains the compatibility boundary for future clients and backends.
 - **Integration owner:** the main implementation thread owns cross-boundary schema and deployment integration; the connected-impact metric-context repair is independently verified.
-- **Verification owner:** the main implementation thread ran the full suite, static verifier, disposable runtime gate, dedicated queue-saturation gate, and fresh read-only independent seam review.
+- **Verification owner:** the main implementation thread ran the full suite, static verifier, disposable runtime gate, dedicated queue-saturation gate, and fresh read-only independent seam review. The full suite and static verifier remain current; the disposable runtime gate is pre-split and pending a rerun.
 - **Highest-risk assumption:** a single-host SQLite canonical store is sufficient for the first private deployment; its repository interface makes later migration explicit and lossless.
 - **Likely failure mode:** a locally valid adapter or dashboard silently treats estimated or client-reported usage as provider-authoritative; provenance tests and dashboard evidence labels prevent this.
 - **Remaining release evidence:** one fresh user-authorized real-client acceptance run after the Claude plain-key mapping fix, a stable-state host reboot, human visual review, off-host encrypted restore, and organization-specific signed-image promotion.

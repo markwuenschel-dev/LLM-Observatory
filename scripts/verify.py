@@ -125,7 +125,7 @@ def main() -> int:
             failures.append("efficiency dashboard has no valid model-operation default")
 
     compose = (ROOT / "compose.yaml").read_text(encoding="utf-8") if (ROOT / "compose.yaml").exists() else ""
-    for forbidden in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY", "Bearer ", "network_mode: host", "block_on_overflow: true"):
+    for forbidden in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY", "network_mode: host", "block_on_overflow: true"):
         if forbidden in compose:
             failures.append(f"forbidden deployment value present: {forbidden}")
     published_lines = [line.strip() for line in compose.splitlines() if line.strip().startswith('- "') and ":" in line]
@@ -134,7 +134,7 @@ def main() -> int:
             failures.append(f"published port is not loopback-only: {line}")
     if "/otelcol-contrib" not in compose or "validate" not in compose:
         failures.append("Compose must validate the Collector configuration in its healthcheck")
-    for required in ("127.0.0.1:13133:13133", "PROMETHEUS_RETENTION_TIME", "OBSERVATORY_MAX_DATABASE_BYTES", "config.expand-env=true", "otel-queue-init", "service_completed_successfully", "--allow-insecure-remote", '"8888"'):
+    for required in ("127.0.0.1:13133:13133", "PROMETHEUS_RETENTION_TIME", "OBSERVATORY_API_TOKEN_FILE", "OBSERVATORY_API_AUTHORIZATION_FILE", "api-bridge-check", "host.docker.internal", "config.expand-env=true", "otel-queue-init", "service_completed_successfully", '"8888"'):
         if required not in compose:
             failures.append(f"Compose missing operational control: {required}")
     for required in (
@@ -166,9 +166,27 @@ def main() -> int:
         failures.append("production collector must not use the debug exporter")
 
     datasources = (ROOT / "deployment/grafana/provisioning/datasources/datasources.yaml").read_text(encoding="utf-8") if (ROOT / "deployment/grafana/provisioning/datasources/datasources.yaml").exists() else ""
-    for required in ("Observatory Events", "uid: prometheus", "url: http://observatory-api:8787", "name: Prometheus", "uid: system-prometheus", "url: http://prometheus:9090"):
+    for required in ("Observatory Events", "uid: prometheus", "url: http://host.docker.internal:8788", "httpHeaderName1: Authorization", "name: Prometheus", "uid: system-prometheus", "url: http://prometheus:9090"):
         if required not in datasources:
             failures.append(f"Grafana datasource provisioning missing event-time/system contract: {required}")
+
+    # The Observatory Events source targets the host read plane, which serves GET
+    # only.  A POST datasource silently 404s every panel, so scope the method
+    # assertion to that datasource block rather than the whole file: the separate
+    # system-prometheus source talks to real Prometheus and may keep POST.
+    events_block = ""
+    if datasources:
+        start = datasources.find("- name: Observatory Events")
+        if start == -1:
+            failures.append("Grafana datasource provisioning is missing the Observatory Events source")
+        else:
+            following = datasources.find(chr(10) + "  - name:", start + 1)
+            events_block = datasources[start:] if following == -1 else datasources[start:following]
+    if events_block:
+        if "httpMethod: GET" not in events_block:
+            failures.append("Observatory Events datasource must use httpMethod: GET against the GET-only read plane")
+        if "httpMethod: POST" in events_block:
+            failures.append("Observatory Events datasource must not POST to the GET-only read plane")
 
     capability_matrix = (ROOT / "docs/capability-matrix.yaml").read_text(encoding="utf-8") if (ROOT / "docs/capability-matrix.yaml").exists() else ""
     if "    - hooks_or_events" not in capability_matrix:

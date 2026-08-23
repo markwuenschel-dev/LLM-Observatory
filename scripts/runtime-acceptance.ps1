@@ -14,11 +14,10 @@ $composeFile = Join-Path $repositoryRoot "compose.yaml"
 $fixtureFile = Join-Path $repositoryRoot "examples\synthetic-events.jsonl"
 $temporaryState = [string]::IsNullOrWhiteSpace($StateDir)
 $composeProject = "llm-observatory-acceptance-$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
-$acceptanceApiImage = "llm-observatory-api:acceptance-$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
 $previousProjectName = $env:COMPOSE_PROJECT_NAME
 $previousPythonPath = $env:PYTHONPATH
-$previousApiImage = $env:OBSERVATORY_API_IMAGE
 $script:ApiBase = "http://127.0.0.1:8787"
+$script:ReadApiBase = "http://127.0.0.1:8788"
 $script:GrafanaBase = "http://127.0.0.1:3000"
 $script:CollectorBase = "http://127.0.0.1:13133"
 $script:OtlpHttpBase = "http://127.0.0.1:4318"
@@ -135,7 +134,28 @@ function Get-JsonEndpoint {
 }
 
 function Get-Events {
-    return @((Get-JsonEndpoint "$script:ApiBase/v1/events?limit=256").events)
+    return @((Get-JsonEndpoint "$script:ReadApiBase/v1/events?limit=256").events)
+}
+
+function Stop-ManagedHostApi {
+    $pidPath = Join-Path $statePath "api.pid.json"
+    if (-not (Test-Path -LiteralPath $pidPath)) {
+        return
+    }
+    $managedPid = $null
+    try {
+        $record = Get-Content -LiteralPath $pidPath -Raw | ConvertFrom-Json
+        if ($record.pid) {
+            $managedPid = [int]$record.pid
+            Stop-Process -Id $managedPid -Force -ErrorAction SilentlyContinue
+            $deadline = [DateTime]::UtcNow.AddSeconds(10)
+            while ([DateTime]::UtcNow -lt $deadline -and (Get-Process -Id $managedPid -ErrorAction SilentlyContinue)) {
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    } finally {
+        Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Assert-Equal {
@@ -538,6 +558,7 @@ try {
 
     New-Item -ItemType Directory -Path $statePath -Force | Out-Null
     $apiPort = Get-FreeLoopbackPort
+    $readApiPort = Get-FreeLoopbackPort
     $grafanaPort = Get-FreeLoopbackPort
     $collectorPort = Get-FreeLoopbackPort
     $otlpGrpcPort = Get-FreeLoopbackPort
@@ -545,9 +566,33 @@ try {
     $runtimeComposeFile = Join-Path $statePath "compose.acceptance.yaml"
     $composeText = Get-Content -LiteralPath $composeFile -Raw
     $repoForCompose = $repositoryRoot.Replace('\', '/')
+    $runtimeDeploymentRoot = Join-Path $statePath "deployment"
+    $runtimeOtelConfig = Join-Path $runtimeDeploymentRoot "otel-collector\config.yaml"
+    $runtimePrometheusConfig = Join-Path $runtimeDeploymentRoot "prometheus\prometheus.yml"
+    $runtimeGrafanaProvisioning = Join-Path $runtimeDeploymentRoot "grafana\provisioning"
+    New-Item -ItemType Directory -Path (Split-Path -Parent $runtimeOtelConfig), (Split-Path -Parent $runtimePrometheusConfig) -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "deployment\otel-collector\config.yaml") -Destination $runtimeOtelConfig -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "deployment\prometheus\prometheus.yml") -Destination $runtimePrometheusConfig -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "deployment\grafana\provisioning") -Destination $runtimeGrafanaProvisioning -Recurse -Force
+    $runtimeOtelText = (Get-Content -LiteralPath $runtimeOtelConfig -Raw).Replace('host.docker.internal:8787', "host.docker.internal:$apiPort")
+    $runtimeOtelText = $runtimeOtelText.Replace('host.docker.internal:8788', "host.docker.internal:$readApiPort")
+    Set-Content -LiteralPath $runtimeOtelConfig -Value $runtimeOtelText -Encoding utf8 -NoNewline
+    $runtimePrometheusText = (Get-Content -LiteralPath $runtimePrometheusConfig -Raw).Replace('host.docker.internal:8788', "host.docker.internal:$readApiPort")
+    Set-Content -LiteralPath $runtimePrometheusConfig -Value $runtimePrometheusText -Encoding utf8 -NoNewline
+    $runtimeGrafanaDatasource = Join-Path $runtimeGrafanaProvisioning "datasources\datasources.yaml"
+    $runtimeGrafanaText = (Get-Content -LiteralPath $runtimeGrafanaDatasource -Raw).Replace('host.docker.internal:8788', "host.docker.internal:$readApiPort")
+    Set-Content -LiteralPath $runtimeGrafanaDatasource -Value $runtimeGrafanaText -Encoding utf8 -NoNewline
+    $runtimeOtelForCompose = $runtimeOtelConfig.Replace('\', '/')
+    $runtimePrometheusForCompose = $runtimePrometheusConfig.Replace('\', '/')
+    $runtimeGrafanaForCompose = $runtimeGrafanaProvisioning.Replace('\', '/')
     $composeText = $composeText.Replace('context: .', "context: $repoForCompose")
     $composeText = $composeText.Replace('./deployment', "$repoForCompose/deployment")
     $composeText = $composeText.Replace('./dashboards', "$repoForCompose/dashboards")
+    $composeText = $composeText.Replace("$repoForCompose/deployment/otel-collector/config.yaml", $runtimeOtelForCompose)
+    $composeText = $composeText.Replace("$repoForCompose/deployment/prometheus/prometheus.yml", $runtimePrometheusForCompose)
+    $composeText = $composeText.Replace("$repoForCompose/deployment/grafana/provisioning", $runtimeGrafanaForCompose)
+    $composeText = $composeText.Replace('host.docker.internal:8787', "host.docker.internal:$apiPort")
+    $composeText = $composeText.Replace('host.docker.internal:8788', "host.docker.internal:$readApiPort")
     $composeText = $composeText.Replace('127.0.0.1:8787:8787', "127.0.0.1:${apiPort}:8787")
     $composeText = $composeText.Replace('127.0.0.1:3000:3000', "127.0.0.1:${grafanaPort}:3000")
     $composeText = $composeText.Replace('127.0.0.1:13133:13133', "127.0.0.1:${collectorPort}:13133")
@@ -555,59 +600,70 @@ try {
     $composeText = $composeText.Replace('127.0.0.1:4318:4318', "127.0.0.1:${otlpHttpPort}:4318")
     Set-Content -LiteralPath $runtimeComposeFile -Value $composeText -Encoding utf8 -NoNewline
     $composeFile = $runtimeComposeFile
+    $script:ReadApiBase = "http://127.0.0.1:$readApiPort"
     $script:ApiBase = "http://127.0.0.1:${apiPort}"
     $script:GrafanaBase = "http://127.0.0.1:${grafanaPort}"
     $script:CollectorBase = "http://127.0.0.1:${collectorPort}"
     $script:OtlpHttpBase = "http://127.0.0.1:${otlpHttpPort}"
     $env:COMPOSE_PROJECT_NAME = $composeProject
     $env:PYTHONPATH = Join-Path $repositoryRoot "src"
-    $env:OBSERVATORY_API_IMAGE = $acceptanceApiImage
-
     $install = Invoke-ObservatoryCli @("install", "--compose-file", $composeFile)
     Assert-Equal $install.outcome "success" "install did not succeed"
     $result.checks.install = @{ status = "pass"; changed = $install.data.changed }
-
-    Invoke-Compose @("build", "--pull=false", "observatory-api") | Out-Null
-    $result.checks.api_build = @{ status = "pass"; image = $acceptanceApiImage }
 
     $doctor = Invoke-ObservatoryCli -CliArgs @("doctor", "--compose-file", $composeFile) -AllowedExitCodes @(0, 5)
     Assert-True ($doctor.outcome -in @("success", "degraded")) "doctor returned an unexpected outcome"
     $result.checks.doctor = @{ status = "pass"; outcome = $doctor.outcome }
 
-    $start = Invoke-ObservatoryCli @("start", "--compose-file", $composeFile, "--api-url", "$script:ApiBase/readyz", "--collector-url", "$script:CollectorBase/", "--grafana-url", "$script:GrafanaBase/api/health")
+    $start = Invoke-ObservatoryCli @("start", "--compose-file", $composeFile, "--api-port", [string]$apiPort, "--read-port", [string]$readApiPort, "--api-url", "$script:ApiBase/readyz", "--read-url", "$script:ReadApiBase/readz", "--collector-url", "$script:CollectorBase/", "--grafana-url", "$script:GrafanaBase/api/health")
     Assert-Equal $start.outcome "success" "start did not pass readiness"
     $result.checks.start = @{ status = "pass"; readiness = $start.data.readiness }
+    # api-bridge-check performs bearer-authenticated wget calls from a container to
+    # both host planes.  Container traffic arrives off the Docker bridge rather than
+    # loopback, so --trust-loopback does not apply and its exit code is the bearer proof.
+    $bridgeRaw = Invoke-Compose @('ps', '-a', '--format', 'json', 'api-bridge-check')
+    $bridgeEntries = @()
+    foreach ($bridgeLine in ($bridgeRaw -split '
+?
+')) {
+        if ($bridgeLine.Trim()) { $bridgeEntries += ($bridgeLine.Trim() | ConvertFrom-Json) }
+    }
+    Assert-True ($bridgeEntries.Count -gt 0) 'api-bridge-check container was never created'
+    $bridgeExit = [int]$bridgeEntries[0].ExitCode
+    Assert-Equal $bridgeExit 0 'api-bridge-check failed: the bearer-authenticated container-to-host bridge did not reach both API planes'
+    $result.checks.api_bridge = @{ status = 'pass'; service = 'api-bridge-check'; exit_code = $bridgeExit; bearer_authenticated = $true; control = $script:ApiBase; read = $script:ReadApiBase }
 
     Wait-Http "$script:ApiBase/readyz" | Out-Null
+    Wait-Http "$script:ReadApiBase/readz" | Out-Null
     Wait-Http "$script:CollectorBase/" | Out-Null
     Wait-Http "$script:GrafanaBase/api/health" | Out-Null
     $health = Get-JsonEndpoint "$script:ApiBase/healthz"
     Assert-Equal $health.status "ok" "normalizer health is not ok"
-    $metrics = (Invoke-WebRequest -UseBasicParsing -Uri "$script:ApiBase/metrics" -TimeoutSec 10).Content
+    $metrics = (Invoke-WebRequest -UseBasicParsing -Uri "$script:ReadApiBase/metrics" -TimeoutSec 10).Content
     Assert-True ($metrics -match "observatory_process_ready 1") "normalizer metrics did not expose readiness"
     $result.checks.health = @{ status = "pass"; api = $health.status }
 
     $ingest = Invoke-ObservatoryCli @("ingest", "--file", $fixtureFile, "--url", "$script:ApiBase/v1/events")
     Assert-True ($ingest.data.inserted -gt 0) "synthetic JSONL was not delivered to the normalizer"
     $result.checks.synthetic_ingest = @{ status = "pass"; inserted = $ingest.data.inserted }
-    $fixtureSummary = (Get-JsonEndpoint "$script:ApiBase/v1/summary").data
+    $fixtureSummary = (Get-JsonEndpoint "$script:ReadApiBase/v1/summary").data
     Assert-True ($fixtureSummary.tool_calls -ge 5 -and $fixtureSummary.files_changed -ge 2 -and $fixtureSummary.commands_executed -ge 5 -and $fixtureSummary.tests_invoked -ge 3) "normalized agent behavior counts were not aggregated"
     Assert-True ($fixtureSummary.agent_failures -ge 1 -and $fixtureSummary.reassessments -ge 2 -and $fixtureSummary.rework_loops -ge 1) "normalized agent reliability dimensions were not aggregated"
     $result.checks.synthetic_agent_behavior = @{ status = "pass"; tool_calls = $fixtureSummary.tool_calls; files_changed = $fixtureSummary.files_changed; commands_executed = $fixtureSummary.commands_executed; tests_invoked = $fixtureSummary.tests_invoked; agent_failures = $fixtureSummary.agent_failures; reassessments = $fixtureSummary.reassessments; rework_loops = $fixtureSummary.rework_loops }
 
-    $before = (Get-JsonEndpoint "$script:ApiBase/v1/summary").data.events
+    $before = (Get-JsonEndpoint "$script:ReadApiBase/v1/summary").data.events
     $otlp = Send-SyntheticOtlpTrace
     Assert-True ($otlp.StatusCode -ge 200 -and $otlp.StatusCode -lt 300) "Collector OTLP request was not accepted"
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
-        $after = (Get-JsonEndpoint "$script:ApiBase/v1/summary").data.events
+        $after = (Get-JsonEndpoint "$script:ReadApiBase/v1/summary").data.events
         if ($after -gt $before) { break }
         Start-Sleep -Seconds 1
     } while ([DateTime]::UtcNow -lt $deadline)
     Assert-True ($after -gt $before) "Collector-to-normalizer trace delivery was not observed"
     $result.checks.collector_delivery = @{ status = "pass"; response = $otlp.StatusCode; events_before = $before; events_after = $after }
 
-    $claudeBefore = (Get-JsonEndpoint "$script:ApiBase/v1/summary").data.events
+    $claudeBefore = (Get-JsonEndpoint "$script:ReadApiBase/v1/summary").data.events
     $claudeOtlp = Send-ClaudeShapedOtlpLog
     Assert-True ($claudeOtlp.StatusCode -ge 200 -and $claudeOtlp.StatusCode -lt 300) "Claude-shaped plain-key OTLP log was not accepted"
     $claudeDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -638,7 +694,7 @@ try {
     $projectEvent = $null
     do {
         try {
-            $projectEvent = Get-JsonEndpoint "$script:ApiBase/v1/events/otel:$projectTraceId`:$projectSpanId"
+            $projectEvent = Get-JsonEndpoint "$script:ReadApiBase/v1/events/otel:$projectTraceId`:$projectSpanId"
             if ($projectEvent.event.project.project_id -like "local_sha256:*") { break }
         } catch { }
         Start-Sleep -Seconds 1
@@ -654,7 +710,7 @@ try {
     $cwdEvent = $null
     do {
         try {
-            $cwdEvent = Get-JsonEndpoint "$script:ApiBase/v1/events/otel:$cwdTraceId`:$cwdSpanId"
+            $cwdEvent = Get-JsonEndpoint "$script:ReadApiBase/v1/events/otel:$cwdTraceId`:$cwdSpanId"
             if ($cwdEvent.event.project.project_id -like "local_sha256:*") { break }
         } catch { }
         Start-Sleep -Seconds 1
@@ -662,7 +718,7 @@ try {
     Assert-True ($null -ne $cwdEvent -and $cwdEvent.event.project.project_id -like "local_sha256:*" -and $null -eq $cwdEvent.event.project.root) "Collector did not derive a safe project identity from a native working-directory attribute"
     $result.checks.project_attribution_working_directory = @{ status = "pass"; project_id = $cwdEvent.event.project.project_id; raw_working_directory_persisted = $false }
 
-    $privacyBefore = (Get-JsonEndpoint "$script:ApiBase/v1/summary").data.events
+    $privacyBefore = (Get-JsonEndpoint "$script:ReadApiBase/v1/summary").data.events
     $privacyOtlp = Send-SyntheticOtlpTrace -TraceId "fedcba9876543210fedcba9876543210" -SpanId "fedcba9876543210" -IncludePrivacyCanary
     $privacyLog = Send-SyntheticOtlpLog -IncludePrivacyCanary
     $privacyMetric = Send-SyntheticOtlpMetric -IncludePrivacyCanary
@@ -671,12 +727,12 @@ try {
     Assert-True ($privacyMetric.StatusCode -ge 200 -and $privacyMetric.StatusCode -lt 300) "Collector privacy metric canary was not accepted"
     $privacyDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
-        $privacyAfter = (Get-JsonEndpoint "$script:ApiBase/v1/summary").data.events
+        $privacyAfter = (Get-JsonEndpoint "$script:ReadApiBase/v1/summary").data.events
         if ($privacyAfter -ge ($privacyBefore + 3)) { break }
         Start-Sleep -Seconds 1
     } while ([DateTime]::UtcNow -lt $privacyDeadline)
     Assert-True ($privacyAfter -ge ($privacyBefore + 3)) "Collector privacy trace/log/metric canaries were not delivered to the normalizer"
-    $eventJson = (Get-JsonEndpoint "$script:ApiBase/v1/events?limit=100" | ConvertTo-Json -Depth 40)
+    $eventJson = (Get-JsonEndpoint "$script:ReadApiBase/v1/events?limit=100" | ConvertTo-Json -Depth 40)
     $privacyCanaries = @("RUNTIME_PROMPT_CANARY", "RUNTIME_COMPLETION_CANARY", "RUNTIME_API_KEY_CANARY", "RUNTIME_SECRET_CANARY", "RUNTIME_BODY_CANARY", "RUNTIME_AUTH_TOKEN_CANARY", "RUNTIME_CLIENT_SECRET_CANARY", "RUNTIME_PROMPT_TEXT_CANARY", "RUNTIME_TOOL_ARGUMENTS_CANARY", "RUNTIME_UNKNOWN_SENSITIVE_CANARY", "RUNTIME_UNKNOWN_ATTRIBUTE_CANARY", "RUNTIME_PROJECT_ROOT_CANARY", "RUNTIME_PROJECT_REMOTE_CANARY", "RUNTIME_PROCESS_ENVIRONMENT_CANARY", "RUNTIME_USER_EMAIL_CANARY", "RUNTIME_ENVIRONMENT_CANARY", "RUNTIME_LOG_PROMPT_CANARY", "RUNTIME_LOG_PROMPT_ATTRIBUTE_CANARY", "RUNTIME_LOG_API_KEY_CANARY", "RUNTIME_LOG_PROCESS_ENVIRONMENT_CANARY", "RUNTIME_LOG_USER_EMAIL_CANARY", "RUNTIME_METRIC_API_KEY_CANARY", "RUNTIME_METRIC_PROCESS_ENVIRONMENT_CANARY", "RUNTIME_METRIC_USER_EMAIL_CANARY")
     foreach ($canary in $privacyCanaries) {
         Assert-True (-not $eventJson.Contains($canary)) "Collector privacy canary '$canary' was persisted"
@@ -757,7 +813,7 @@ try {
     $dashboardFilterProbe = Invoke-GrafanaDashboardFilterProbe -Headers $headers
     $result.checks.dashboard_filter_probe = @{ status = "pass"; queries = @($dashboardFilterProbe.Keys); project_alpha_events = $dashboardFilterProbe.project_alpha_events; project_beta_events = $dashboardFilterProbe.project_beta_events }
 
-    Invoke-Compose @("restart", "observatory-api", "otel-collector", "grafana") | Out-Null
+    Invoke-Compose @("restart", "otel-collector", "grafana") | Out-Null
     Wait-Http "$script:ApiBase/readyz" | Out-Null
     Wait-Http "$script:CollectorBase/" | Out-Null
     Wait-Http "$script:GrafanaBase/api/health" | Out-Null
@@ -780,28 +836,29 @@ try {
     Invoke-Compose @("start", "otel-collector") | Out-Null
     Wait-Http "$script:CollectorBase/" | Out-Null
 
-    $queuedBefore = (Get-JsonEndpoint "$script:ApiBase/v1/summary").data.events
+    $queuedBefore = (Get-JsonEndpoint "$script:ReadApiBase/v1/summary").data.events
     $queuedTraceId = "00112233445566770011223344556677"
     $queuedSpanId = "0011223344556677"
     $queuedEventId = "otel:$queuedTraceId`:$queuedSpanId"
-    Invoke-Compose @("stop", "observatory-api") | Out-Null
+    Stop-ManagedHostApi
     $queuedOtlp = Send-SyntheticOtlpTrace -TraceId $queuedTraceId -SpanId $queuedSpanId
     Assert-True ($queuedOtlp.StatusCode -ge 200 -and $queuedOtlp.StatusCode -lt 300) "Collector did not accept telemetry while the normalizer was unavailable"
-    Invoke-Compose @("start", "observatory-api") | Out-Null
+    $restartedHost = Invoke-ObservatoryCli @("start", "--compose-file", $composeFile, "--api-port", [string]$apiPort, "--read-port", [string]$readApiPort, "--api-url", "$script:ApiBase/readyz", "--read-url", "$script:ReadApiBase/readz", "--collector-url", "$script:CollectorBase/", "--grafana-url", "$script:GrafanaBase/api/health")
+    Assert-Equal $restartedHost.outcome "success" "host API did not recover after a managed process stop"
     Wait-Http "$script:ApiBase/readyz" | Out-Null
     $queueDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
-        $queuedAfter = (Get-JsonEndpoint "$script:ApiBase/v1/summary").data.events
+        $queuedAfter = (Get-JsonEndpoint "$script:ReadApiBase/v1/summary").data.events
         if ($queuedAfter -gt $queuedBefore) { break }
         Start-Sleep -Seconds 1
     } while ([DateTime]::UtcNow -lt $queueDeadline)
     Assert-True ($queuedAfter -gt $queuedBefore) "Collector queued telemetry was not delivered after normalizer recovery"
-    $queuedEvent = Get-JsonEndpoint "$script:ApiBase/v1/events/$queuedEventId"
+    $queuedEvent = Get-JsonEndpoint "$script:ReadApiBase/v1/events/$queuedEventId"
     Assert-True ($queuedEvent.event.event_id -eq $queuedEventId) "Collector queued telemetry did not retain the expected event identity after normalizer recovery"
     $result.checks.normalizer_outage_queue_recovery = @{ status = "pass"; events_before = $queuedBefore; events_after = $queuedAfter; collector_response = $queuedOtlp.StatusCode; event_id = $queuedEventId }
 
     $recoveryArchive = Join-Path ([IO.Path]::GetTempPath()) "llm-observatory-acceptance-full-state-$([Guid]::NewGuid().ToString('N')).zip"
-    $recoveryEventsBefore = (Get-JsonEndpoint "$script:ApiBase/v1/summary").data.events
+    $recoveryEventsBefore = (Get-JsonEndpoint "$script:ReadApiBase/v1/summary").data.events
     $recoveryEventIdsBefore = @{}
     foreach ($event in (Get-Events)) {
         if ($null -ne $event.event_id) { $recoveryEventIdsBefore[[string]$event.event_id] = $true }
@@ -825,16 +882,16 @@ try {
     } while ([DateTime]::UtcNow -lt $recoveryLogDeadline)
     Assert-True ($null -ne $recoveryEvent) "Recovery log fixture was not normalized before full-state backup"
     $recoveryEventId = [string]$recoveryEvent.event_id
-    Invoke-Compose @("stop") | Out-Null
+    Invoke-ObservatoryCli @("stop", "--compose-file", $composeFile) | Out-Null
     $backup = Invoke-ObservatoryCli @("backup", $recoveryArchive, "--full-state", "--backend-volumes", "--include-secret", "--compose-file", $composeFile, "--overwrite")
     Assert-Equal $backup.outcome "success" "full-state backend-volume backup did not succeed"
     Assert-Equal $backup.data.docker_named_volumes "included" "full-state backup did not include backend volumes"
     Invoke-Compose @("down", "--remove-orphans", "--volumes") | Out-Null
     $restore = Invoke-ObservatoryCli @("restore", $recoveryArchive, "--full-state", "--backend-volumes", "--restore-secret", "--compose-file", $composeFile, "--api-health-url", "$script:ApiBase/healthz", "--overwrite")
     Assert-Equal $restore.outcome "success" "full-state backend-volume restore did not succeed"
-    $recoveredStart = Invoke-ObservatoryCli @("start", "--compose-file", $composeFile, "--api-url", "$script:ApiBase/readyz", "--collector-url", "$script:CollectorBase/", "--grafana-url", "$script:GrafanaBase/api/health")
+    $recoveredStart = Invoke-ObservatoryCli @("start", "--compose-file", $composeFile, "--api-port", [string]$apiPort, "--read-port", [string]$readApiPort, "--api-url", "$script:ApiBase/readyz", "--read-url", "$script:ReadApiBase/readz", "--collector-url", "$script:CollectorBase/", "--grafana-url", "$script:GrafanaBase/api/health")
     Assert-Equal $recoveredStart.outcome "success" "stack did not restart after full-state restore"
-    $recoveredSummary = (Get-JsonEndpoint "$script:ApiBase/v1/summary").data.events
+    $recoveredSummary = (Get-JsonEndpoint "$script:ReadApiBase/v1/summary").data.events
     Assert-True ($recoveredSummary -ge $recoveryEventsBefore) "normalized events were not retained across full-state restore"
     $recoveredMetric = Wait-GrafanaPrometheusMetric -Headers (Wait-GrafanaApi)
     Assert-True ($recoveredMetric -ge $recoveryEventsBefore) "Prometheus data was not retained across full-state restore"
@@ -849,22 +906,22 @@ try {
         Start-Sleep -Seconds 1
     } while ([DateTime]::UtcNow -lt $recoveryTraceDeadline)
     Assert-True ($null -ne $tempoSearch -and @($tempoSearch.traces).Count -gt 0) "The known recovery trace was not retained across full-state restore"
-    $recoveredLogEvent = Get-JsonEndpoint "$script:ApiBase/v1/events/$recoveryEventId"
+    $recoveredLogEvent = Get-JsonEndpoint "$script:ReadApiBase/v1/events/$recoveryEventId"
     Assert-True ($recoveredLogEvent.event.event_id -eq $recoveryEventId -and $recoveredLogEvent.event.event_type -eq "telemetry.log") "The known recovery log event was not retained across full-state restore"
     $lokiLabels = Invoke-RestMethod -Headers (Get-GrafanaHeaders) -Uri "$script:GrafanaBase/api/datasources/proxy/uid/loki/loki/api/v1/labels" -TimeoutSec 10
     Assert-True (@($lokiLabels.data).Count -gt 0) "Loki labels were not retained across full-state restore"
     $result.checks.full_disaster_recovery = @{ status = "pass"; archive = $recoveryArchive; events_before = $recoveryEventsBefore; events_after = $recoveredSummary; prometheus_events = $recoveredMetric; recovery_trace_event_id = $queuedEventId; recovery_log_event_id = $recoveryEventId; tempo_traces = @($tempoSearch.traces).Count; recovered_log_event = $recoveredLogEvent.event.event_id; loki_labels = @($lokiLabels.data).Count }
 
-    Invoke-Compose @("stop", "observatory-api") | Out-Null
+    Stop-ManagedHostApi
     $storageSentinel = Invoke-InferenceSentinel
     $plan = Invoke-ObservatoryCli -CliArgs @("configure", "all") -AllowedExitCodes @(0, 5)
     Assert-True ($plan.outcome -in @("partial", "success")) "client configuration plan depended on the normalizer"
     $result.checks.storage_failure_isolation = @{ status = "pass"; normalizer_storage = "unavailable"; client_plan = $plan.outcome; inference_sentinel = $storageSentinel.output; inference_proxy = $plan.data.inference_proxy }
     $result.checks.api_failure_isolation = @{ status = "pass"; client_plan = $plan.outcome; inference_sentinel = $storageSentinel.output; inference_proxy = $plan.data.inference_proxy }
-    Invoke-Compose @("start", "observatory-api") | Out-Null
-    Wait-Http "$script:ApiBase/readyz" | Out-Null
+    $restartedHost = Invoke-ObservatoryCli @("start", "--compose-file", $composeFile, "--api-port", [string]$apiPort, "--read-port", [string]$readApiPort, "--api-url", "$script:ApiBase/readyz", "--read-url", "$script:ReadApiBase/readz", "--collector-url", "$script:CollectorBase/", "--grafana-url", "$script:GrafanaBase/api/health")
+    Assert-Equal $restartedHost.outcome "success" "host API did not recover after storage isolation"
 
-    $status = Invoke-ObservatoryCli @("status", "--url", "$script:ApiBase/healthz", "--grafana-url", "$script:GrafanaBase/api/health", "--collector-url", "$script:CollectorBase/")
+    $status = Invoke-ObservatoryCli @("status", "--url", "$script:ApiBase/healthz", "--read-url", "$script:ReadApiBase/readz", "--grafana-url", "$script:GrafanaBase/api/health", "--collector-url", "$script:CollectorBase/")
     Assert-Equal $status.outcome "success" "final status did not report a ready Observatory"
     $result.checks.final_status = @{ status = "pass"; observatory = $status.data.observatory; inference_path = $status.data.inference_path }
 } catch {
@@ -877,6 +934,7 @@ try {
         if ($null -ne $recoveryArchive -and (Test-Path -LiteralPath $recoveryArchive)) {
             Remove-Item -LiteralPath $recoveryArchive -Force
         }
+        Stop-ManagedHostApi
         if (Test-Path -LiteralPath (Join-Path $statePath "compose.env")) {
             $downArgs = @("down", "--remove-orphans")
             if (-not $KeepVolumes) {
@@ -891,22 +949,8 @@ try {
     if ($temporaryState -and -not $KeepState -and (Test-Path -LiteralPath $statePath)) {
         Remove-Item -LiteralPath $statePath -Recurse -Force
     }
-    try {
-        $apiImageIds = @(& docker image ls --quiet $acceptanceApiImage 2>$null)
-        if ($LASTEXITCODE -eq 0 -and $apiImageIds.Count -gt 0) {
-            $removedApiImage = & docker image rm $acceptanceApiImage 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                $result.status = "fail"
-                $result.cleanup_warning = "acceptance API image cleanup failed: $(($removedApiImage | Out-String).Trim())"
-            }
-        }
-    } catch {
-        $result.status = "fail"
-        $result.cleanup_warning = "acceptance API image cleanup failed: $($_.Exception.Message)"
-    }
     if ($null -eq $previousProjectName) { Remove-Item Env:COMPOSE_PROJECT_NAME -ErrorAction SilentlyContinue } else { $env:COMPOSE_PROJECT_NAME = $previousProjectName }
     if ($null -eq $previousPythonPath) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $previousPythonPath }
-    if ($null -eq $previousApiImage) { Remove-Item Env:OBSERVATORY_API_IMAGE -ErrorAction SilentlyContinue } else { $env:OBSERVATORY_API_IMAGE = $previousApiImage }
 }
 
 $result | ConvertTo-Json -Depth 40

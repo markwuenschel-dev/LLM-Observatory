@@ -41,6 +41,7 @@ $runtimeComposeFile = $null
 $acceptanceRunId = "provider-acceptance-$([Guid]::NewGuid().ToString('N'))"
 $acceptanceResourceAttribute = "llm.observatory.acceptance.run_id=$acceptanceRunId"
 $script:ApiBase = "http://127.0.0.1:8787"
+$script:ReadApiBase = "http://127.0.0.1:8788"
 $script:CollectorBase = "http://127.0.0.1:13133"
 
 function Assert-True {
@@ -106,13 +107,27 @@ function Get-FreeLoopbackPort {
 function Write-RuntimeCompose {
     param(
         [Parameter(Mandatory = $true)][int]$ApiPort,
+        [Parameter(Mandatory = $true)][int]$ReadApiPort,
         [Parameter(Mandatory = $true)][int]$GrafanaPort,
         [Parameter(Mandatory = $true)][int]$CollectorPort,
         [Parameter(Mandatory = $true)][int]$OtlpGrpcPort,
         [Parameter(Mandatory = $true)][int]$OtlpHttpPort
     )
 
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "deployment\otel-collector\config.yaml") -Destination $runtimeOtelConfig -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "deployment\prometheus\prometheus.yml") -Destination $runtimePrometheusConfig -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "deployment\grafana\provisioning\datasources\datasources.yaml") -Destination (Join-Path $runtimeGrafanaProvisioning "datasources\datasources.yaml") -Force
     $rendered = $composeTemplate
+    $runtimeOtelText = (Get-Content -LiteralPath $runtimeOtelConfig -Raw).Replace('host.docker.internal:8787', "host.docker.internal:$ApiPort")
+    $runtimeOtelText = $runtimeOtelText.Replace('host.docker.internal:8788', "host.docker.internal:$ReadApiPort")
+    Set-Content -LiteralPath $runtimeOtelConfig -Value $runtimeOtelText -Encoding utf8 -NoNewline
+    $runtimePrometheusText = (Get-Content -LiteralPath $runtimePrometheusConfig -Raw).Replace('host.docker.internal:8788', "host.docker.internal:$ReadApiPort")
+    Set-Content -LiteralPath $runtimePrometheusConfig -Value $runtimePrometheusText -Encoding utf8 -NoNewline
+    $runtimeGrafanaDatasource = Join-Path $runtimeGrafanaProvisioning "datasources\datasources.yaml"
+    $runtimeGrafanaText = (Get-Content -LiteralPath $runtimeGrafanaDatasource -Raw).Replace('host.docker.internal:8788', "host.docker.internal:$ReadApiPort")
+    Set-Content -LiteralPath $runtimeGrafanaDatasource -Value $runtimeGrafanaText -Encoding utf8 -NoNewline
+    $rendered = $rendered.Replace('host.docker.internal:8787', "host.docker.internal:$ApiPort")
+    $rendered = $rendered.Replace('host.docker.internal:8788', "host.docker.internal:$ReadApiPort")
     $rendered = $rendered.Replace('127.0.0.1:8787:8787', "127.0.0.1:${ApiPort}:8787")
     $rendered = $rendered.Replace('127.0.0.1:3000:3000', "127.0.0.1:${GrafanaPort}:3000")
     $rendered = $rendered.Replace('127.0.0.1:13133:13133', "127.0.0.1:${CollectorPort}:13133")
@@ -121,6 +136,7 @@ function Write-RuntimeCompose {
     Set-Content -LiteralPath $runtimeComposeFile -Value $rendered -Encoding utf8 -NoNewline
     $script:ApiBase = "http://127.0.0.1:${ApiPort}"
     $script:CollectorBase = "http://127.0.0.1:${CollectorPort}"
+    $script:ReadApiBase = "http://127.0.0.1:$ReadApiPort"
     $env:OBSERVATORY_OTLP_GRPC_ENDPOINT = "http://127.0.0.1:${OtlpGrpcPort}"
     $env:OBSERVATORY_OTLP_HTTP_ENDPOINT = "http://127.0.0.1:${OtlpHttpPort}"
 }
@@ -134,7 +150,7 @@ function Stop-IsolatedCompose {
 }
 
 function Get-Events {
-    $response = Invoke-RestMethod -Uri "$script:ApiBase/v1/events?limit=256" -TimeoutSec 10
+    $response = Invoke-RestMethod -Uri "$script:ReadApiBase/v1/events?limit=256" -TimeoutSec 10
     return @($response.events)
 }
 
@@ -236,16 +252,31 @@ try {
     $runtimeComposeFile = Join-Path $statePath "compose.acceptance.yaml"
     $composeTemplate = Get-Content -LiteralPath $composePath -Raw
     $repoForCompose = $repositoryRoot.Replace('\', '/')
+    $runtimeDeploymentRoot = Join-Path $statePath "deployment"
+    $runtimeOtelConfig = Join-Path $runtimeDeploymentRoot "otel-collector\config.yaml"
+    $runtimePrometheusConfig = Join-Path $runtimeDeploymentRoot "prometheus\prometheus.yml"
+    $runtimeGrafanaProvisioning = Join-Path $runtimeDeploymentRoot "grafana\provisioning"
+    New-Item -ItemType Directory -Path (Split-Path -Parent $runtimeOtelConfig), (Split-Path -Parent $runtimePrometheusConfig) -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "deployment\otel-collector\config.yaml") -Destination $runtimeOtelConfig -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "deployment\prometheus\prometheus.yml") -Destination $runtimePrometheusConfig -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "deployment\grafana\provisioning") -Destination $runtimeGrafanaProvisioning -Recurse -Force
+    $runtimeOtelForCompose = $runtimeOtelConfig.Replace('\', '/')
+    $runtimePrometheusForCompose = $runtimePrometheusConfig.Replace('\', '/')
+    $runtimeGrafanaForCompose = $runtimeGrafanaProvisioning.Replace('\', '/')
     $composeTemplate = $composeTemplate.Replace('context: .', "context: $repoForCompose")
     $composeTemplate = $composeTemplate.Replace('./deployment', "$repoForCompose/deployment")
     $composeTemplate = $composeTemplate.Replace('./dashboards', "$repoForCompose/dashboards")
+    $composeTemplate = $composeTemplate.Replace("$repoForCompose/deployment/otel-collector/config.yaml", $runtimeOtelForCompose)
+    $composeTemplate = $composeTemplate.Replace("$repoForCompose/deployment/prometheus/prometheus.yml", $runtimePrometheusForCompose)
+    $composeTemplate = $composeTemplate.Replace("$repoForCompose/deployment/grafana/provisioning", $runtimeGrafanaForCompose)
     $composePath = [IO.Path]::GetFullPath($runtimeComposeFile)
     $apiPort = Get-FreeLoopbackPort
+    $readApiPort = Get-FreeLoopbackPort
     $grafanaPort = Get-FreeLoopbackPort
     $collectorPort = Get-FreeLoopbackPort
     $otlpGrpcPort = Get-FreeLoopbackPort
     $otlpHttpPort = Get-FreeLoopbackPort
-    Write-RuntimeCompose -ApiPort $apiPort -GrafanaPort $grafanaPort -CollectorPort $collectorPort -OtlpGrpcPort $otlpGrpcPort -OtlpHttpPort $otlpHttpPort
+    Write-RuntimeCompose -ApiPort $apiPort -ReadApiPort $readApiPort -GrafanaPort $grafanaPort -CollectorPort $collectorPort -OtlpGrpcPort $otlpGrpcPort -OtlpHttpPort $otlpHttpPort
     $composePath = (Resolve-Path $runtimeComposeFile).Path
     $beforeGit = Get-GitStatus
     $install = Invoke-ObservatoryCli @("install", "--compose-file", $composePath)
@@ -279,7 +310,7 @@ try {
     do {
         $startAttempts++
         try {
-            $start = Invoke-ObservatoryCli @("start", "--compose-file", $composePath, "--api-url", "$script:ApiBase/readyz", "--collector-url", "$script:CollectorBase/", "--grafana-url", "http://127.0.0.1:${grafanaPort}/api/health")
+            $start = Invoke-ObservatoryCli @("start", "--compose-file", $composePath, "--api-port", [string]$apiPort, "--read-port", [string]$readApiPort, "--api-url", "$script:ApiBase/readyz", "--read-url", "$script:ReadApiBase/readz", "--collector-url", "$script:CollectorBase/", "--grafana-url", "http://127.0.0.1:${grafanaPort}/api/health")
             $startError = $null
         } catch {
             $start = $null
@@ -295,14 +326,16 @@ try {
         }
         Stop-IsolatedCompose
         $apiPort = Get-FreeLoopbackPort
+        $readApiPort = Get-FreeLoopbackPort
         $grafanaPort = Get-FreeLoopbackPort
         $collectorPort = Get-FreeLoopbackPort
         $otlpGrpcPort = Get-FreeLoopbackPort
         $otlpHttpPort = Get-FreeLoopbackPort
-        Write-RuntimeCompose -ApiPort $apiPort -GrafanaPort $grafanaPort -CollectorPort $collectorPort -OtlpGrpcPort $otlpGrpcPort -OtlpHttpPort $otlpHttpPort
+        Write-RuntimeCompose -ApiPort $apiPort -ReadApiPort $readApiPort -GrafanaPort $grafanaPort -CollectorPort $collectorPort -OtlpGrpcPort $otlpGrpcPort -OtlpHttpPort $otlpHttpPort
     } while ($startAttempts -lt $portRetryLimit)
     $result.checks.start = @{ status = "pass"; attempts = $startAttempts; port_retry_limit = $portRetryLimit }
     Wait-Http "$script:ApiBase/readyz"
+    Wait-Http "$script:ReadApiBase/readz"
     $beforeEvents = Get-Events
     $beforeIds = @{}
     foreach ($event in $beforeEvents) {

@@ -8,7 +8,11 @@ from types import SimpleNamespace
 import unittest
 import zipfile
 
-from observatory.maintenance import BACKEND_VOLUME_KEYS, backup_database, backup_state, inspect_backend_volume_capacity, purge_events, resolve_backend_volumes, restore_database, restore_state, schema_versions
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
+
+from observatory.cli import EXIT_DEGRADED, main as cli_main
+from observatory.maintenance import BACKEND_VOLUME_KEYS, DEFAULT_RETENTION_TARGET_RATIO, backup_database, backup_state, enforce_normalized_retention, inspect_backend_volume_capacity, purge_events, resolve_backend_volumes, restore_database, restore_state, schema_versions
 from observatory.contracts import NormalizedEvent
 from observatory.store import EventStore
 
@@ -197,7 +201,9 @@ class MaintenanceTests(unittest.TestCase):
                 self.assertIn("003_maintenance", schema_versions(store))
                 purge_result = purge_events(store, event_ids=["maint-1"], confirm=True)
                 self.assertEqual(purge_result["affected_events"], 1)
-                self.assertIn(purge_result["compaction"]["status"], ("completed", "deferred"))
+                # A one-event purge must not rewrite the whole database; the
+                # threshold exists so a scheduled sweep cannot starve intake.
+                self.assertEqual(purge_result["compaction"]["status"], "skipped")
                 self.assertIsNone(store.get("maint-1"))
                 self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM maintenance_actions").fetchone()[0], 2)
                 store.append(make_event("maint-2"))
@@ -277,6 +283,201 @@ class MaintenanceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     purge_events(store, before="not-a-timestamp", confirm=True)
 
+
+
+class PurgeCompactionTests(unittest.TestCase):
+    """A purge must not transiently inflate the measured store size.
+
+    VACUUM rebuilds the database through the WAL, and `storage_bytes()` counts
+    the WAL, so without a checkpoint afterwards the measurement roughly doubles
+    right after a purge. Near the budget that makes the capacity guard reject
+    intake -- an outage caused by the operation meant to prevent one.
+    """
+
+    def test_storage_shrinks_after_a_purge_rather_than_ballooning(self):
+        import tempfile
+        from datetime import datetime, timedelta, timezone
+        from pathlib import Path as _Path
+
+        from observatory.contracts import NormalizedEvent
+        from observatory.maintenance import purge_events
+        from observatory.store import EventStore
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = EventStore(_Path(temp) / "events.sqlite3")
+            try:
+                old = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+                for index in range(200):
+                    store.append(
+                        NormalizedEvent.from_mapping(
+                            {
+                                "schema_version": "1.0",
+                                "event_id": f"old-{index}",
+                                "event_type": "model.operation",
+                                "observed_at": old,
+                                "received_at": old,
+                                "project": {"project_id": "repo_sha256:abc"},
+                                "llm": {"provider": "anthropic", "model": "claude-opus-5", "client": "claude-code"},
+                                "attributes": {"filler": "x" * 2000},
+                            }
+                        )
+                    )
+                before = store.storage_bytes()
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+                result = purge_events(store, before=cutoff, confirm=True, compact=True)
+                after = store.storage_bytes()
+
+                self.assertEqual(result["affected_events"], 200)
+                self.assertEqual(result["compaction"]["status"], "completed")
+                # The whole point: measured size must not grow after a purge.
+                self.assertLessEqual(after, before)
+                wal = _Path(f"{store.path}-wal")
+                if wal.exists():
+                    self.assertLess(wal.stat().st_size, before)
+            finally:
+                store.close()
+
+
+class RetentionMeasurementTests(unittest.TestCase):
+    """Retention must decide from a truthful size, and report honestly.
+
+    ``storage_bytes()`` counts the ``-wal`` sidecar, and the read plane keeps
+    passive checkpoints from resetting it, so the inflated reading is the
+    normal one. Sizing a purge from it deletes telemetry that never needed
+    deleting -- and this runs unattended every 15 minutes.
+    """
+
+    @staticmethod
+    def _seed(store, count: int, *, filler: int = 2000) -> None:
+        base = datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc)
+        for index in range(count):
+            stamp = (base - timedelta(minutes=count - index)).isoformat()
+            store.append(
+                NormalizedEvent.from_mapping(
+                    {
+                        "schema_version": "1.0",
+                        "event_id": f"retain-{index}",
+                        "event_type": "model.operation",
+                        "observed_at": stamp,
+                        "received_at": stamp,
+                        "project": {"project_id": "repo_sha256:abc"},
+                        "llm": {"provider": "anthropic", "model": "claude-opus-5", "client": "claude-code"},
+                        "attributes": {"filler": "x" * filler},
+                    }
+                )
+            )
+
+    @staticmethod
+    def _durable_bytes(store) -> int:
+        """The page image the store actually holds, WAL sidecar excluded."""
+
+        page_count = int(store.connection.execute("PRAGMA page_count").fetchone()[0])
+        page_size = int(store.connection.execute("PRAGMA page_size").fetchone()[0])
+        return page_count * page_size
+
+    @staticmethod
+    def _budget_for(target_bytes: int) -> int:
+        return int(target_bytes / DEFAULT_RETENTION_TARGET_RATIO) + 1
+
+    def test_wal_inflation_alone_never_deletes_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with EventStore(Path(temp) / "events.sqlite3") as store:
+                self._seed(store, 300)
+                inflated = store.storage_bytes()
+                durable = self._durable_bytes(store)
+                # Precondition: the uncheckpointed reading is the misleading one.
+                self.assertGreater(inflated, durable * 2)
+
+                # A budget the store already satisfies once the WAL is folded in,
+                # but that the inflated reading blows straight through.
+                max_bytes = self._budget_for(durable + 128 * 1024)
+                self.assertLess(int(max_bytes * DEFAULT_RETENTION_TARGET_RATIO), inflated)
+
+                report = enforce_normalized_retention(store, max_bytes=max_bytes)
+                remaining = int(store.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+
+                self.assertEqual(remaining, 300)
+                self.assertEqual(report["deleted_events"], 0)
+                self.assertEqual(report["outcome"], "satisfied")
+                self.assertEqual(report["reasons"], [])
+
+    def test_a_checkpoint_blocked_by_a_reader_still_does_not_over_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "events.sqlite3"
+            with EventStore(path, busy_timeout_ms=50) as store:
+                self._seed(store, 300)
+                durable = self._durable_bytes(store)
+                reader = sqlite3.connect(path, timeout=0.1)
+                try:
+                    reader.execute("BEGIN")
+                    reader.execute("SELECT COUNT(*) FROM events").fetchone()
+                    # Precondition: the dashboard read plane blocks the truncate.
+                    busy = store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    self.assertNotEqual(int(busy[0]), 0)
+                    self.assertGreater(store.storage_bytes(), durable * 2)
+
+                    max_bytes = self._budget_for(durable + 128 * 1024)
+                    report = enforce_normalized_retention(store, max_bytes=max_bytes)
+                    remaining = int(store.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+                finally:
+                    reader.rollback()
+                    reader.close()
+
+                self.assertEqual(remaining, 300)
+                self.assertEqual(report["deleted_events"], 0)
+                self.assertFalse(report["measurement"]["checkpointed"])
+
+    def test_still_over_budget_after_the_purge_is_not_reported_as_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with EventStore(Path(temp) / "events.sqlite3") as store:
+                self._seed(store, 400)
+                report = enforce_normalized_retention(store, max_bytes=200_000)
+
+                self.assertGreater(report["deleted_events"], 0)
+                self.assertGreater(report["bytes_after"], report["target_bytes"])
+                self.assertEqual(report["outcome"], "ineffective")
+                self.assertIn("still", report["blocker"])
+
+    def test_both_return_paths_share_one_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with EventStore(Path(temp) / "events.sqlite3") as store:
+                self._seed(store, 40)
+                satisfied = enforce_normalized_retention(store, max_bytes=8 * 1024 * 1024 * 1024)
+                acted = enforce_normalized_retention(store, max_bytes=200_000)
+
+                self.assertEqual(satisfied["outcome"], "satisfied")
+                self.assertNotEqual(acted["outcome"], "satisfied")
+                self.assertEqual(sorted(satisfied), sorted(acted))
+                for key in ("blocker", "action_id", "compaction", "measurement"):
+                    self.assertIn(key, satisfied)
+
+
+class RetentionCliHonestyTests(unittest.TestCase):
+    """``observatory retention --enforce`` printed success and exited 0 while
+    the store stayed far over budget: only a ``--json`` reader could see it."""
+
+    def _run(self, arguments: list[str]) -> tuple[int, dict]:
+        output = io.StringIO()
+        errors = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            code = cli_main(["--json", *arguments])
+        return code, json.loads(output.getvalue())
+
+    def test_ineffective_enforcement_is_visible_at_the_process_level(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            self._run(["--state-dir", temp, "install"])
+            database = Path(temp) / "data" / "events.sqlite3"
+            with EventStore(database, max_bytes=None) as store:
+                RetentionMeasurementTests._seed(store, 400)
+
+            code, result = self._run([
+                "--state-dir", temp, "retention", "--enforce", "--max-database-bytes", "200000",
+            ])
+
+            self.assertEqual(result["data"]["enforcement"]["outcome"], "ineffective")
+            self.assertEqual(result["outcome"], "degraded")
+            self.assertEqual(code, EXIT_DEGRADED)
+            self.assertTrue(any("still" in warning for warning in result["warnings"]))
 
 if __name__ == "__main__":
     unittest.main()

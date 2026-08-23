@@ -80,10 +80,9 @@ class DeploymentTests(unittest.TestCase):
             "--remove-orphans",
             "--volumes",
             "KeepVolumes",
-            "api_build",
-            "OBSERVATORY_API_IMAGE",
-            "llm-observatory-api:acceptance-",
-            "docker image ls --quiet",
+            "host.docker.internal",
+            "api-bridge-check",
+            "ReadApiBase",
         ):
             self.assertIn(marker, script)
 
@@ -131,14 +130,12 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("stop_grace_period: 30s", compose)
         self.assertIn("mem_limit: 512m", compose)
         self.assertIn("cpus: 1.0", compose)
-        self.assertIn("OBSERVATORY_STATE_DIR", compose)
-        self.assertIn("OBSERVATORY_API_IMAGE", compose)
-        self.assertIn("OBSERVATORY_MAX_DATABASE_BYTES", compose)
-        self.assertIn("--allow-remote", compose)
-        self.assertIn("--allow-insecure-remote", compose)
+        self.assertIn("OBSERVATORY_API_TOKEN_FILE", compose)
+        self.assertIn("OBSERVATORY_API_AUTHORIZATION_FILE", compose)
+        self.assertIn("api-bridge-check", compose)
+        self.assertIn("host.docker.internal", compose)
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("--allow-insecure-remote", dockerfile)
-        self.assertIn("max-database-bytes", compose)
         self.assertNotIn("observatory-data:", compose)
         self.assertIn("otel-queue:", compose)
         self.assertIn("otel-queue-init:", compose)
@@ -152,7 +149,8 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("validate", compose)
         self.assertIn("127.0.0.1:3000:3000", compose)
         self.assertNotIn("network_mode: host", compose)
-        self.assertNotIn("observatory-api:\n        condition: service_healthy", compose)
+        self.assertNotIn("observatory-api:", compose)
+        self.assertNotIn("/var/lib/observatory", compose)
         self.assertNotIn("prometheus:\n        condition: service_healthy", compose)
         self.assertIn('      - "8888"', compose)
         for image_marker in ("OTEL_COLLECTOR_IMAGE:-otel/opentelemetry-collector-contrib@sha256:", "ALPINE_IMAGE:-alpine@sha256:", "TEMPO_IMAGE:-grafana/tempo@sha256:", "LOKI_IMAGE:-grafana/loki@sha256:", "PROMETHEUS_IMAGE:-prom/prometheus@sha256:", "GRAFANA_IMAGE:-grafana/grafana@sha256:"):
@@ -165,7 +163,7 @@ class DeploymentTests(unittest.TestCase):
 
     def test_collector_has_bounded_fail_open_controls(self) -> None:
         collector = (ROOT / "deployment/otel-collector/config.yaml").read_text(encoding="utf-8")
-        for marker in ("memory_limiter", "transform/project_identity", "SHA256", "process.cwd", "current_working_directory", "redaction/privacy", "allow_all_keys: false", "allowed_keys:", "event.name", "event.sequence", "- model", "- provider", "- client", "session_id", "workflow_id", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "cost_usd", "duration_ms", "ttft_ms", "agent_id", "parent_agent_id", "workflow.run_id", "llm.observatory.project.id", "llm.observatory.tool.call.count", "llm.observatory.files.changed.count", "llm.observatory.acceptance.run_id", "llm.observatory.extensions", "llm.observatory.error.kind", "llm.observatory.rate_limited", "blocked_key_patterns:", "auth[_-]?token", "client[_-]?secret", "prompt[_-]?text", "tool[_-]?arguments?", "process[._-]?", "user[._-]?", "blocked_values:", "redact_all_types: true", "summary: silent", "batch:", "sending_queue:", "file_storage:", "create_directory: true", "max_elapsed_time", "max_size: 268435456", "fsync: true", "out_of_band", "otlphttp/normalizer", "encoding: json", "http://observatory-api:8787", "resource/privacy", "attributes/privacy", "gen_ai.prompt", "llm.observatory.project.root", "transform/privacy", "set(log.body, \"[CONTENT_REDACTED]\")", "context: spanevent", "check_collector_pipeline", "exporter_failure_threshold", "max_request_body_size: 8388608", "telemetry:", "level: normal", "readers:", "host: 0.0.0.0", "port: 8888"):
+        for marker in ("memory_limiter", "transform/project_identity", "SHA256", "process.cwd", "current_working_directory", "redaction/privacy", "allow_all_keys: false", "allowed_keys:", "event.name", "event.sequence", "- model", "- provider", "- client", "session_id", "workflow_id", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "cost_usd", "duration_ms", "ttft_ms", "agent_id", "parent_agent_id", "workflow.run_id", "llm.observatory.project.id", "llm.observatory.tool.call.count", "llm.observatory.files.changed.count", "llm.observatory.acceptance.run_id", "llm.observatory.extensions", "llm.observatory.error.kind", "llm.observatory.rate_limited", "blocked_key_patterns:", "auth[_-]?token", "client[_-]?secret", "prompt[_-]?text", "tool[_-]?arguments?", "process[._-]?", "user[._-]?", "blocked_values:", "redact_all_types: true", "summary: silent", "batch:", "sending_queue:", "file_storage:", "create_directory: true", "max_elapsed_time", "max_size: 268435456", "fsync: true", "out_of_band", "otlphttp/normalizer", "encoding: json", "host.docker.internal:8787", "bearertokenauth/normalizer", "resource/privacy", "attributes/privacy", "gen_ai.prompt", "llm.observatory.project.root", "transform/privacy", "set(log.body, \"[CONTENT_REDACTED]\")", "context: spanevent", "check_collector_pipeline", "exporter_failure_threshold", "max_request_body_size: 8388608", "telemetry:", "level: normal", "readers:", "host: 0.0.0.0", "port: 8888"):
             self.assertIn(marker, collector)
         self.assertNotIn("allow_all_keys: true", collector)
         self.assertNotIn("block_on_overflow: true", collector)
@@ -195,7 +193,17 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("loki", json.dumps(dashboard))
         datasource_text = (ROOT / "deployment/grafana/provisioning/datasources/datasources.yaml").read_text(encoding="utf-8")
         self.assertIn("Observatory Events", datasource_text)
-        self.assertIn("url: http://observatory-api:8787", datasource_text)
+        self.assertIn("url: http://host.docker.internal:8788", datasource_text)
+        # The Observatory Events source targets the GET-only host read plane;
+        # a POST datasource 404s every panel.  Scope the assertion to that block
+        # so the separate real-Prometheus source may keep POST.
+        events_block = datasource_text[datasource_text.index("- name: Observatory Events"):]
+        following = events_block.find(chr(10) + "  - name:", 1)
+        if following != -1:
+            events_block = events_block[:following]
+        self.assertIn("httpMethod: GET", events_block)
+        self.assertNotIn("httpMethod: POST", events_block)
+        self.assertIn("secureJsonData:", datasource_text)
         self.assertIn("system-prometheus", datasource_text)
         self.assertIn("datasourceUid: system-prometheus", datasource_text)
         self.assertIn("tempo", datasource_text)
@@ -282,7 +290,7 @@ class DeploymentTests(unittest.TestCase):
     def test_no_provider_credentials_are_in_deployment_files(self) -> None:
         for relative in ("compose.yaml", "deployment/otel-collector/config.yaml", "deployment/grafana/provisioning/datasources/datasources.yaml"):
             text = (ROOT / relative).read_text(encoding="utf-8")
-            for forbidden in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY", "Bearer "):
+            for forbidden in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY"):
                 self.assertNotIn(forbidden, text)
 
     def test_static_verifier_rejects_a_deliberate_dashboard_contract_violation(self) -> None:

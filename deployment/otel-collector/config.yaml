@@ -13,6 +13,9 @@ extensions:
     fsync: true
     compaction:
       on_start: true
+  bearertokenauth/normalizer:
+    scheme: Bearer
+    filename: /run/secrets/observatory_api_token
 
 receivers:
   otlp:
@@ -395,10 +398,49 @@ processors:
       - context: log
         statements:
           - set(log.body, "[CONTENT_REDACTED]")
+  # Tempo keeps every span at full fidelity. The normalized store only earns
+  # value from spans that carry LLM identity: codex-app-server emits ~758
+  # structurally-empty internal spans/sec (model/provider/session all unknown or
+  # null, no name, no measurements) which were 99% of normalized-store volume and
+  # ~350 GB/day. Dropping them here costs no analysis -- the raw spans remain
+  # queryable in Tempo. Remove this processor from the traces/normalizer pipeline
+  # to restore the previous behaviour.
+  # SCHEMA DRIFT, 2026-08-23: this condition NO LONGER MATCHES. codex-app-server
+  # 0.149.0-alpha.4.1 began stamping `model` on every internal span, so
+  # `attributes["model"] == nil` is false and the whole AND-chain fails. 564,679
+  # spans (99.91% of codex spans) reached the normalized store carrying a bare
+  # model label and nothing else. The effective drop now happens downstream in
+  # `otel_bridge._is_analytically_empty_span`, which runs on the normalized
+  # record where the shape is testable; this processor is retained because it
+  # still catches the genuinely attribute-free case cheaply.
+  #
+  # Do not "fix" the condition from stored data: this processor runs BEFORE
+  # redaction, so the attributes it sees are not the allowlisted subset that
+  # ends up in the store. Rewriting it needs a live capture of the raw span.
+  filter/normalizer_spans:
+    error_mode: ignore
+    traces:
+      span:
+        - >-
+          attributes["gen_ai.system"] == nil
+          and attributes["gen_ai.request.model"] == nil
+          and attributes["gen_ai.operation.name"] == nil
+          and attributes["model"] == nil
+          and attributes["provider"] == nil
+          and attributes["session.id"] == nil
+          and attributes["agent_id"] == nil
+          and attributes["input_tokens"] == nil
+          and attributes["output_tokens"] == nil
+          and attributes["tool.name"] == nil
+          and attributes["tool_name"] == nil
+          and not IsMatch(name, "(?i)(gen_ai|llm|tool|model|completion|chat)")
   batch:
     timeout: 1s
     send_batch_size: 256
-    send_batch_max_size: 512
+    # Must not exceed the normalized API's Intake max_records (256, api.py:116).
+    # A larger batch is rejected wholesale with HTTP 400 (api.py:99), which the
+    # Collector treats as permanent and drops -- losing every record in it.
+    send_batch_max_size: 256
 
 exporters:
   otlp/tempo:
@@ -425,9 +467,11 @@ exporters:
       enabled: true
       max_elapsed_time: 30s
   otlphttp/normalizer:
-    endpoint: http://observatory-api:8787
+    endpoint: http://host.docker.internal:8787
     encoding: json
     compression: none
+    auth:
+      authenticator: bearertokenauth/normalizer
     sending_queue:
       enabled: true
       storage: file_storage
@@ -449,12 +493,18 @@ service:
               prometheus:
                 host: 0.0.0.0
                 port: 8888
-  extensions: [health_check, file_storage]
+  extensions: [health_check, file_storage, bearertokenauth/normalizer]
   pipelines:
     traces:
       receivers: [otlp]
       processors: [memory_limiter, transform/project_identity, redaction/privacy, resource/observatory, resource/privacy, attributes/privacy, transform/privacy, batch]
-      exporters: [otlp/tempo, otlphttp/normalizer]
+      exporters: [otlp/tempo]
+    # Same privacy chain; the filter runs first so it sees the original span
+    # attributes rather than the post-redaction allowlisted subset.
+    traces/normalizer:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/normalizer_spans, transform/project_identity, redaction/privacy, resource/observatory, resource/privacy, attributes/privacy, transform/privacy, batch]
+      exporters: [otlphttp/normalizer]
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, transform/project_identity, redaction/privacy, resource/observatory, resource/privacy, attributes/privacy, batch]

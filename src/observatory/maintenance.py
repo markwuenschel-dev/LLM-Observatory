@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from contextlib import closing
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -138,6 +139,11 @@ BACKEND_VOLUME_KEYS = (
 _DOCKER_VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _DOCKER_SIZE = re.compile(r"^\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>B|kB|MB|GB|TB|KiB|MiB|GiB|TiB)?\s*$", re.IGNORECASE)
 _BACKEND_ARCHIVE_ROOT = "backend-volumes"
+_SECRET_FILES = (
+    "secrets/grafana_admin_password",
+    "secrets/observatory_api_token",
+    "secrets/observatory_api_authorization",
+)
 
 
 def _copy_zip_member_bounded(archive: zipfile.ZipFile, member: str, destination: Path, *, maximum: int) -> int:
@@ -530,9 +536,13 @@ def backup_state(
         for spool_file in sorted((root / "spool").glob("*.jsonl")) if (root / "spool").exists() else ():
             if spool_file.is_file():
                 files.append((spool_file, f"spool/{spool_file.name}"))
-        secret = root / "secrets" / "grafana_admin_password"
-        if include_secret and secret.exists():
-            files.append((secret, "secrets/grafana_admin_password"))
+        managed_secrets_included = False
+        if include_secret:
+            for member in _SECRET_FILES:
+                secret = root / member
+                if secret.exists():
+                    files.append((secret, member))
+                    managed_secrets_included = True
 
         staged_backend: dict[str, Path] = {}
         if validated_backend_volumes is not None:
@@ -557,7 +567,7 @@ def backup_state(
             "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "scope": "host_state_and_backend_volumes" if validated_backend_volumes is not None else "host_state_only",
             "docker_named_volumes": "included" if validated_backend_volumes is not None else "excluded",
-            "secret_included": include_secret and secret.exists(),
+            "secret_included": managed_secrets_included,
             "encryption": "operator-managed",
             "files": manifest_files,
             "backend_volumes": backend_manifest,
@@ -638,7 +648,7 @@ def restore_state(
         if backend_manifest and not manifest.get("secret_included"):
             raise ValueError("backend-volume restore requires the Grafana secret; create the backup with --include-secret and encrypt it for storage")
         if manifest.get("secret_included") and not restore_secret:
-            raise ValueError("this backup includes the Grafana secret; pass --restore-secret explicitly")
+            raise ValueError("this backup includes managed secrets; pass --restore-secret explicitly")
         validated_backend_volumes = _validated_backend_volume_map(backend_volumes) if backend_volumes is not None else None
         if validated_backend_volumes is not None and set(backend_manifest) != set(validated_backend_volumes):
             raise ValueError("restore backend volume map does not match the archive volume set")
@@ -703,7 +713,7 @@ def restore_state(
             existing_files: dict[str, Path] = {}
             missing_files: set[str] = set()
             for member in files:
-                if member == "secrets/grafana_admin_password" and not restore_secret:
+                if member.startswith("secrets/") and not restore_secret:
                     continue
                 raw_target = root / member
                 target = raw_target.resolve(strict=False)
@@ -740,7 +750,7 @@ def restore_state(
             restored_backend: list[str] = []
             try:
                 for member in sorted(files):
-                    if member == "secrets/grafana_admin_password" and not restore_secret:
+                    if member.startswith("secrets/") and not restore_secret:
                         skipped.append(member)
                         continue
                     _atomic_copy(staged / member, root / member)
@@ -798,7 +808,7 @@ def restore_state(
         "target_root": str(root),
         "restored": restored,
         "skipped": skipped,
-        "secret_restored": "secrets/grafana_admin_password" in restored,
+        "secret_restored": any(member in restored for member in _SECRET_FILES),
         "restored_backend_volumes": restored_backend,
         "docker_named_volumes": "included" if validated_backend_volumes is not None else "excluded",
     }
@@ -810,8 +820,14 @@ def purge_events(
     before: str | None = None,
     event_ids: Iterable[str] = (),
     confirm: bool = False,
+    compact: bool | None = None,
 ) -> dict[str, Any]:
     """Physically delete selected telemetry with an append-only audit record.
+
+    ``compact`` controls the post-delete rewrite: True always compacts (an
+    operator running `prune` expects the space back), False never does, and the
+    default defers to a size threshold so a scheduled sweep does not rewrite a
+    multi-GB store to reclaim a handful of rows.
 
     The application append path cannot invoke this function.  Callers must
     explicitly confirm, and the immutable evidence triggers are removed only
@@ -837,11 +853,23 @@ def purge_events(
         params.extend(ids)
     if not clauses:
         raise ValueError("purge requires before or at least one event id")
-    rows = store.connection.execute(
-        f"SELECT event_id FROM events WHERE {' OR '.join(clauses)} ORDER BY event_id",
-        params,
-    ).fetchall()
-    selected = [str(row["event_id"]) for row in rows]
+    # The id list must be chunked here too: `prune --event-id` with more ids
+    # than SQLite's parameter ceiling raised OperationalError, which is not one
+    # of the exception types the callers catch, so it surfaced as a traceback.
+    selected: list[str] = []
+    if before is not None:
+        rows = store.connection.execute(
+            "SELECT event_id FROM events WHERE observed_at < ? ORDER BY event_id", (before,)
+        ).fetchall()
+        selected.extend(str(row["event_id"]) for row in rows)
+    for offset in range(0, len(ids), PURGE_CHUNK_SIZE):
+        chunk = ids[offset : offset + PURGE_CHUNK_SIZE]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = store.connection.execute(
+            f"SELECT event_id FROM events WHERE event_id IN ({placeholders})", chunk
+        ).fetchall()
+        selected.extend(str(row["event_id"]) for row in rows)
+    selected = sorted(set(selected))
     action_id = f"maintenance:{uuid.uuid4()}"
     requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     selector = json.dumps({"before": before, "event_ids": ids}, sort_keys=True)
@@ -853,11 +881,18 @@ def purge_events(
             )
             for trigger in _EVIDENCE_TRIGGERS:
                 store.connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            if selected:
-                placeholders = ",".join("?" for _ in selected)
+            # SQLite binds at most SQLITE_LIMIT_VARIABLE_NUMBER (32766)
+            # parameters per statement, and the edge delete uses two per event.
+            # An unchunked delete therefore raised OperationalError above ~16k
+            # events -- which sqlite3 raises outside the OSError/RuntimeError/
+            # ValueError the callers catch, so a size-driven retention run ended
+            # in a raw traceback rather than a result.
+            for offset in range(0, len(selected), PURGE_CHUNK_SIZE):
+                chunk = selected[offset : offset + PURGE_CHUNK_SIZE]
+                placeholders = ",".join("?" for _ in chunk)
                 store.connection.execute(
                     f"DELETE FROM attribution_edges WHERE child_event_id IN ({placeholders}) OR parent_event_id IN ({placeholders})",
-                    (*selected, *selected),
+                    (*chunk, *chunk),
                 )
                 for table, column in (
                     ("measurement_facts", "event_id"),
@@ -866,7 +901,7 @@ def purge_events(
                     ("event_conflicts", "event_id"),
                     ("events", "event_id"),
                 ):
-                    store.connection.execute(f"DELETE FROM {table} WHERE {column} IN ({placeholders})", selected)
+                    store.connection.execute(f"DELETE FROM {table} WHERE {column} IN ({placeholders})", chunk)
             _restore_evidence_triggers(store.connection)
             completed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             store.connection.execute(
@@ -879,13 +914,45 @@ def purge_events(
         _restore_evidence_triggers(store.connection)
         raise
     compaction: dict[str, Any] = {"status": "not_needed"}
-    if selected:
+    # Compaction rewrites the whole database, so it must not run for a handful
+    # of rows: on a multi-GB store that is minutes of writer lock in exchange
+    # for nothing, and intake -- which uses a short busy timeout so it never
+    # blocks a client -- reports unavailable throughout.
+    if selected and (compact is False or (compact is None and len(selected) < MIN_COMPACTION_EVENTS)):
+        # A DELETE without a checkpoint leaves the freed pages in the WAL, and
+        # `storage_bytes()` counts the WAL -- so a successful purge could report
+        # the store as LARGER than before, keep intake over its budget, and make
+        # retention recompute the same excess forever. Checkpoint even when the
+        # full rewrite is deliberately skipped.
+        reason = "compaction disabled by caller" if compact is False else (
+            f"{len(selected)} events is below the compaction threshold"
+        )
+        try:
+            # The PRAGMA returns (busy, log_pages, checkpointed); busy=1 means it
+            # truncated nothing, and it does not raise. Reporting a hardcoded
+            # True made a failed checkpoint indistinguishable from a real one --
+            # and a reader on the dashboard plane is the documented steady state.
+            row = store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            busy = int(row[0]) if row is not None else 1
+            compaction = {"status": "skipped", "reason": reason, "checkpointed": busy == 0}
+            if busy:
+                compaction["checkpoint_blocked_by_reader"] = True
+        except sqlite3.Error as exc:
+            compaction = {"status": "skipped", "reason": reason, "checkpointed": False, "error": str(exc)}
+    elif selected:
         try:
             checkpoint = store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
             if checkpoint is not None and int(checkpoint[0]) != 0:
                 compaction = {"status": "deferred", "reason": "SQLite WAL checkpoint is busy"}
             else:
                 store.connection.execute("VACUUM")
+                # VACUUM rebuilds the database through the WAL, so the sidecar
+                # transiently holds a copy of the whole store. `storage_bytes()`
+                # counts the WAL, so without a second checkpoint the measured
+                # size roughly doubles immediately after a purge -- and near the
+                # budget that makes the capacity guard reject intake, an outage
+                # caused by the very operation meant to prevent one.
+                store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 compaction = {"status": "completed"}
         except sqlite3.Error as exc:
             compaction = {"status": "deferred", "reason": str(exc)}
@@ -896,3 +963,232 @@ def purge_events(
         "selector": json.loads(selector),
         "compaction": compaction,
     }
+
+
+DEFAULT_RETENTION_TARGET_RATIO = 0.8
+# Below this, compacting costs more than the space it reclaims.
+MIN_COMPACTION_EVENTS = 5000
+# Half the SQLite parameter ceiling, because the edge delete binds two per event.
+PURGE_CHUNK_SIZE = 8000
+
+
+def _measure_store_bytes(store: EventStore) -> dict[str, Any]:
+    """Measure the store the way a deletion decision has to see it.
+
+    ``storage_bytes()`` counts the ``-wal`` sidecar, and ``store.py`` documents
+    that a passive autocheckpoint cannot reset the WAL while the dashboard read
+    plane holds readers -- so the inflated reading is the steady state, not an
+    edge case. Sizing a purge from it deletes telemetry that never needed
+    deleting, unattended, every 15 minutes.
+
+    Two things happen here. The WAL is folded back into the database first, so
+    the space an earlier purge freed is actually returned before anything else
+    is considered for deletion; and the PRAGMA's real return value is read
+    rather than assumed, because a TRUNCATE checkpoint legitimately fails while
+    a reader is open. The size policy then decides on the page image
+    (``page_count * page_size``) -- the durable volume, and the only part of the
+    footprint that deleting rows can move -- so a sidecar that could not be
+    checkpointed can never push retention into destroying telemetry.
+    """
+
+    checkpointed = False
+    try:
+        # (busy, log_pages, checkpointed_pages); busy=1 means the log was not
+        # reset, and the PRAGMA reports that rather than raising.
+        row = store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        checkpointed = row is not None and int(row[0]) == 0
+    except sqlite3.Error:
+        checkpointed = False
+    page_count = int(store.connection.execute("PRAGMA page_count").fetchone()[0])
+    page_size = int(store.connection.execute("PRAGMA page_size").fetchone()[0])
+    return {
+        "durable_bytes": page_count * page_size,
+        "on_disk_bytes": store.storage_bytes(),
+        "checkpointed": checkpointed,
+    }
+
+
+def _sidecar_blocker(measurement: Mapping[str, Any], max_bytes: int) -> str | None:
+    """Report a footprint only a checkpoint -- never a delete -- can bring down."""
+
+    if measurement["checkpointed"] or int(measurement["on_disk_bytes"]) <= max_bytes:
+        return None
+    return (
+        f"the store holds {measurement['durable_bytes']} bytes of data but occupies "
+        f"{measurement['on_disk_bytes']} bytes on disk against a {max_bytes}-byte budget: the WAL "
+        "sidecar could not be checkpointed because a reader is open, and deleting events cannot "
+        "reclaim it. Let the read plane drain and re-run."
+    )
+
+
+def _retention_report(
+    *,
+    outcome: str,
+    blocker: str | None,
+    deleted_events: int,
+    bytes_before: int,
+    bytes_after: int,
+    max_bytes: int,
+    target_bytes: int,
+    cutoff: str | None,
+    reasons: list[str],
+    rows_remaining: int,
+    action_id: str | None,
+    compaction: Any,
+    measurement: Mapping[str, Any],
+) -> dict[str, Any]:
+    """One shape for every exit, so a caller can index the report blind."""
+
+    return {
+        "outcome": outcome,
+        "blocker": blocker,
+        "deleted_events": deleted_events,
+        "bytes_before": bytes_before,
+        "bytes_after": bytes_after,
+        "max_bytes": max_bytes,
+        "target_bytes": target_bytes,
+        "ratio_before": bytes_before / max_bytes,
+        "ratio_after": bytes_after / max_bytes,
+        "cutoff": cutoff,
+        "reasons": reasons,
+        "rows_remaining": rows_remaining,
+        "action_id": action_id,
+        "compaction": compaction,
+        "measurement": dict(measurement),
+    }
+
+
+def enforce_normalized_retention(
+    store: EventStore,
+    *,
+    max_bytes: int,
+    target_ratio: float = DEFAULT_RETENTION_TARGET_RATIO,
+    max_age_days: int | None = None,
+) -> dict[str, Any]:
+    """Bound the normalized store by age and size through the audited purge path.
+
+    Retention is deliberately a maintenance operation rather than an append-path
+    side effect: intake must never delete telemetry in order to accept more of
+    it.  The caller selects the policy; this function only decides which
+    ``observed_at`` cutoff satisfies it and delegates the deletion, WAL
+    checkpoint, and ``maintenance_actions`` audit record to :func:`purge_events`.
+
+    Returns a report even when nothing needs deleting so operators and health
+    checks can distinguish "policy satisfied" from "policy never ran".
+    """
+
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    if not isinstance(target_ratio, (int, float)) or isinstance(target_ratio, bool):
+        raise ValueError("target_ratio must be a number")
+    if not 0 < float(target_ratio) <= 1:
+        raise ValueError("target_ratio must be greater than 0 and at most 1")
+    if max_age_days is not None:
+        if not isinstance(max_age_days, int) or isinstance(max_age_days, bool) or max_age_days < 1:
+            raise ValueError("max_age_days must be a positive integer")
+
+    # Never `store.storage_bytes()` directly: it counts the WAL sidecar, and a
+    # purge sized from an uncheckpointed reading deletes telemetry no policy
+    # asked to delete.
+    measurement = _measure_store_bytes(store)
+    started_bytes = int(measurement["durable_bytes"])
+    target_bytes = int(max_bytes * float(target_ratio))
+    total_rows = int(store.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+
+    reasons: list[str] = []
+    cutoffs: list[str] = []
+
+    if max_age_days is not None:
+        age_cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+        expired = int(
+            store.connection.execute(
+                "SELECT COUNT(*) FROM events WHERE observed_at < ?", (age_cutoff,)
+            ).fetchone()[0]
+        )
+        if expired:
+            cutoffs.append(age_cutoff)
+            reasons.append(f"age:{max_age_days}d")
+
+    size_cutoff: str | None = None
+    if started_bytes > target_bytes and total_rows > 0:
+        excess = started_bytes - target_bytes
+        bytes_per_row = started_bytes / total_rows
+        rows_to_delete = min(total_rows, max(1, math.ceil(excess / bytes_per_row)))
+        row = store.connection.execute(
+            "SELECT observed_at FROM events ORDER BY observed_at LIMIT 1 OFFSET ?",
+            (rows_to_delete,),
+        ).fetchone()
+        # Falling off the end means the policy asks for the whole table; use the
+        # newest timestamp so at least the historical rows go and the store is
+        # never emptied without the operator seeing `rows_remaining: 0`.
+        size_cutoff = str(row[0]) if row is not None else str(
+            store.connection.execute("SELECT MAX(observed_at) FROM events").fetchone()[0]
+        )
+        cutoffs.append(size_cutoff)
+        reasons.append(f"size:{started_bytes}>{target_bytes}")
+
+    if not cutoffs:
+        return _retention_report(
+            outcome="satisfied",
+            blocker=_sidecar_blocker(measurement, max_bytes),
+            deleted_events=0,
+            bytes_before=started_bytes,
+            bytes_after=started_bytes,
+            max_bytes=max_bytes,
+            target_bytes=target_bytes,
+            cutoff=None,
+            reasons=[],
+            rows_remaining=total_rows,
+            action_id=None,
+            compaction={"status": "not_needed"},
+            measurement=measurement,
+        )
+
+    # Whichever policy demands the most deletion wins; both are upper bounds on
+    # what may remain, so the later cutoff satisfies each of them.
+    cutoff = max(cutoffs)
+    purged = purge_events(store, before=cutoff, confirm=True)
+    ended = _measure_store_bytes(store)
+    ended_bytes = int(ended["durable_bytes"])
+    remaining = int(store.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+    deleted = int(purged.get("affected_events", 0) or 0)
+    # Rows deleted is not the question the operator asked. The policy is a size
+    # budget, so the only honest test of "enforced" is whether the store now
+    # fits inside it: deriving success from the delete count reported a store
+    # 20x over budget as enforced while intake stayed refused.
+    if not deleted:
+        # `before` is strict and the size cutoff falls back to MAX(observed_at),
+        # so a store whose candidate events share one timestamp matches nothing.
+        outcome = "ineffective"
+        blocker = (
+            "retention selected a cutoff but deleted nothing: every candidate event shares "
+            "that timestamp, so this policy cannot free space. Widen the age policy or prune "
+            "explicitly by event id."
+        )
+    elif ended_bytes > target_bytes:
+        outcome = "ineffective"
+        blocker = (
+            f"retention deleted {deleted} events and the store is still {ended_bytes} bytes "
+            f"against a {target_bytes}-byte target ({ended_bytes / target_bytes:.1f}x over). "
+            "Deleting rows frees pages inside the database file without returning them to the "
+            "file system, so the budget is met only once a compaction rewrites the store: run "
+            "`observatory purge --before <cutoff> --confirm`, or raise the budget."
+        )
+    else:
+        outcome = "enforced"
+        blocker = _sidecar_blocker(ended, max_bytes)
+    return _retention_report(
+        outcome=outcome,
+        blocker=blocker,
+        deleted_events=deleted,
+        bytes_before=started_bytes,
+        bytes_after=ended_bytes,
+        max_bytes=max_bytes,
+        target_bytes=target_bytes,
+        cutoff=cutoff,
+        reasons=reasons,
+        rows_remaining=remaining,
+        action_id=purged.get("action_id"),
+        compaction=purged.get("compaction"),
+        measurement=ended,
+    )

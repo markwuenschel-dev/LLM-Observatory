@@ -396,3 +396,165 @@ class EventStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SummaryReadBudgetTests(unittest.TestCase):
+    """Pin the plan `summary()` gets, not the wall-clock it happens to take.
+
+    `/v1/summary` is the primary dashboard route and it runs against a 2.0 s
+    read budget (`api.DEFAULT_READ_TIMEOUT`). The events table is mostly
+    `payload_json`, so a row costs about a page to touch and any plan that
+    reaches the table rather than an index is linear in bytes stored: on the
+    live store that was 2.78 s unfiltered and 5.89 s filtered by project, both
+    served to the operator as a 503. Timing that on a fixture proves nothing --
+    a hundred rows are fast however they are read -- so these tests assert the
+    property that stops being true first: that every read `summary()` issues is
+    answered entirely out of the migration 020 indexes.
+    """
+
+    # Shapes the dashboard actually issues, and the ones measured broken: no
+    # filter, a project, and a time window. A selective dimension such as
+    # `provider` is deliberately absent -- its own index is the right plan
+    # there, and asserting coverage would forbid a correct choice.
+    FILTERS = (
+        {},
+        {"project": "project:fixture"},
+        {"start": "2026-08-07T00:00:00Z"},
+        {"start": "2026-08-07T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
+        {"project": "project:fixture", "start": "2026-08-07T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
+    )
+
+    LIVE_EVENTS = 618_219
+
+    def _seeded(self, temp: str) -> EventStore:
+        store = EventStore(f"{temp}/events.sqlite3")
+        for index in range(120):
+            store.append(make_event(f"summary-plan-{index}"))
+        store.append(make_outcome_event("ci", "passed", correlation_id="summary-plan-run", evidence_source="ci"))
+        return store
+
+    def _describe_a_large_store(self, store: EventStore) -> None:
+        """Tell the planner the table is live-sized without building one.
+
+        The bad plans only appear on a large table, so a fixture cannot
+        reproduce them by being seeded harder -- a hundred rows are cheap to
+        read any way at all, and SQLite picks accordingly. Statistics are what
+        the planner actually consults, and `sqlite_stat1` is an ordinary table,
+        so describing the live store's shape there reproduces the live store's
+        plans exactly: 618,219 events, `project_id` skewed across 13 values,
+        `usage_source` across 5. Checked against the real database -- every plan
+        this asserts is the plan the live store produces.
+        """
+
+        rows = [("events", "sqlite_autoindex_events_1", f"{self.LIVE_EVENTS} 1")]
+        distinct = {"project_id": 13, "observed_at": self.LIVE_EVENTS // 2, "usage_source": 5, "received_at": self.LIVE_EVENTS}
+        indexes = [
+            str(row["name"])
+            for row in store.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+                " AND tbl_name = 'events' AND name NOT LIKE 'sqlite_%'"
+            )
+        ]
+        for index in indexes:
+            prefix, stat = 1, [str(self.LIVE_EVENTS)]
+            for column in store.connection.execute(f"PRAGMA index_info({index})"):
+                prefix *= max(1, distinct.get(str(column["name"]), 300))
+                stat.append(str(max(1, self.LIVE_EVENTS // min(prefix, self.LIVE_EVENTS))))
+            rows.append(("events", index, " ".join(stat)))
+        store.connection.execute("ANALYZE")
+        store.connection.execute("DELETE FROM sqlite_stat1 WHERE tbl = 'events'")
+        store.connection.executemany("INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES (?, ?, ?)", rows)
+        store.connection.commit()
+        # Statistics are cached at prepare time; this reloads them.
+        store.connection.execute("ANALYZE sqlite_master")
+
+    @staticmethod
+    def _plan(store: EventStore, sql: str, params) -> list[str]:
+        return [str(row["detail"]) for row in store.connection.execute(f"EXPLAIN QUERY PLAN {sql}", params)]
+
+    def test_summary_reads_are_covered_by_the_rollup_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with self._seeded(temp) as store:
+                self._describe_a_large_store(store)
+                for filters in self.FILTERS:
+                    statements = store._summary_statements(filters)
+                    for name in ("aggregate", "usage_sources"):
+                        sql, params = statements[name]
+                        steps = self._plan(store, sql, params)
+                        touching = [step for step in steps if "events" in step and "outcome_events" not in step]
+                        self.assertTrue(touching, f"{name} {filters}: no step reads events: {steps}")
+                        for step in touching:
+                            self.assertTrue(
+                                any(
+                                    f"COVERING INDEX {index}" in step
+                                    for index in ("idx_events_summary_rollup", "idx_events_usage_source_window")
+                                ),
+                                f"{name} {filters} left the covering indexes: {steps}",
+                            )
+
+    def test_summary_outcomes_probe_events_by_identity_not_by_listing_them(self) -> None:
+        """A filtered summary must not materialize every matching event id.
+
+        `event_id IN (SELECT event_id FROM events WHERE ...)` did exactly that:
+        one random row fetch per matching event to build a list only a few
+        hundred outcomes ever probe. On the live store a one-day window made
+        that single sub-query cost 1.96 s of the 2.0 s budget on its own.
+        """
+
+        with tempfile.TemporaryDirectory() as temp:
+            with self._seeded(temp) as store:
+                for filters in self.FILTERS:
+                    sql, params = store._summary_statements(filters)["outcomes"]
+                    steps = self._plan(store, sql, params)
+                    joined = " ; ".join(steps)
+                    self.assertNotIn("LIST SUBQUERY", joined, f"{filters}: outcomes listed event ids: {steps}")
+                    self.assertTrue(
+                        any("SEARCH events" in step and "event_id=?" in step for step in steps),
+                        f"{filters}: outcomes did not probe events by event_id: {steps}",
+                    )
+
+    def test_rollup_index_lists_every_column_summary_reads(self) -> None:
+        """The covering property, asserted without asking the query planner.
+
+        A fixture is small enough that SQLite might pick a covering scan for
+        reasons unrelated to coverage, so check the containment directly: every
+        `events` column the summary statements mention has to appear in the
+        index, or the plan degrades to a table scan on a store large enough to
+        matter.
+        """
+
+        import re
+
+        with tempfile.TemporaryDirectory() as temp:
+            with self._seeded(temp) as store:
+                columns = {row["name"] for row in store.connection.execute("PRAGMA table_info(events)")}
+                indexed = {
+                    row["name"]
+                    for index in ("idx_events_summary_rollup", "idx_events_usage_source_window")
+                    for row in store.connection.execute(f"PRAGMA index_info({index})")
+                }
+                self.assertTrue(indexed, "migration 020 did not create the summary rollup indexes")
+                referenced: set[str] = set()
+                for filters in self.FILTERS:
+                    statements = store._summary_statements(filters)
+                    for name in ("aggregate", "usage_sources"):
+                        sql = statements[name][0]
+                        referenced |= {token for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", sql) if token in columns}
+                self.assertLessEqual(
+                    referenced,
+                    indexed,
+                    f"summary() reads columns missing from the rollup indexes: {sorted(referenced - indexed)}",
+                )
+
+    def test_rollup_index_changes_no_reported_value(self) -> None:
+        """The index and the rewritten outcome join are pure performance work."""
+
+        with tempfile.TemporaryDirectory() as temp:
+            with self._seeded(temp) as store:
+                with_index = {repr(f): store.summary(f) for f in self.FILTERS}
+                store.connection.execute("DROP INDEX idx_events_summary_rollup")
+                store.connection.execute("DROP INDEX idx_events_usage_source_window")
+                without_index = {repr(f): store.summary(f) for f in self.FILTERS}
+                self.assertEqual(with_index, without_index)
+                self.assertGreater(with_index["{}"]["events"], 0)
+                self.assertTrue(any(value["outcomes"] for value in with_index.values()))

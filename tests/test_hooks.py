@@ -105,5 +105,52 @@ class HookCaptureTests(unittest.TestCase):
             self.assertEqual(list((state / "spool").glob("*.jsonl")), [])
 
 
+
+class InvokedCapabilityTests(unittest.TestCase):
+    """Which skill or workflow ran is the dimension no client reports natively.
+
+    The identifier is present in the hook payload; it was previously kept only
+    as a tool attribute, so skill and workflow comparisons could never be
+    populated from real telemetry.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+
+    def _event(self, payload):
+        from observatory.hooks import build_hook_event
+
+        payload = {"session_id": "S", "hook_event_name": "PostToolUse", "cwd": self._dir.name, **payload}
+        return build_hook_event("claude-code", payload, project_path=self._dir.name)
+
+    def test_a_skill_invocation_names_the_skill(self):
+        event = self._event({"tool_name": "Skill", "tool_input": {"skill": "code-review"}})
+        self.assertEqual(event.execution.skill, "code-review")
+        self.assertIsNone(event.execution.workflow_id)
+
+    def test_a_workflow_invocation_names_the_workflow(self):
+        event = self._event({"tool_name": "Workflow", "tool_input": {"name": "review-changes"}})
+        self.assertEqual(event.execution.workflow_id, "review-changes")
+        self.assertIsNone(event.execution.skill)
+
+    def test_an_ordinary_tool_names_neither(self):
+        event = self._event({"tool_name": "Bash", "tool_input": {"command": "npm test"}})
+        self.assertIsNone(event.execution.skill)
+        self.assertIsNone(event.execution.workflow_id)
+
+    def test_tool_arguments_never_reach_the_event(self):
+        # Only the identifier is read; the rest of tool_input is arguments.
+        event = self._event(
+            {"tool_name": "Skill", "tool_input": {"skill": "code-review", "args": "SENSITIVE-VALUE"}}
+        )
+        self.assertEqual(event.execution.skill, "code-review")
+        self.assertNotIn("SENSITIVE-VALUE", event.to_json())
+
+    def test_a_malformed_tool_input_is_ignored(self):
+        for bad in (None, "a string", 42, []):
+            event = self._event({"tool_name": "Skill", "tool_input": bad})
+            self.assertIsNone(event.execution.skill)
+
 if __name__ == "__main__":
     unittest.main()

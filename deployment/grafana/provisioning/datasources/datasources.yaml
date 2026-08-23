@@ -6,12 +6,16 @@ datasources:
   # observed_at rather than the scrape timestamp of a current snapshot.
   - name: Observatory Events
     uid: prometheus
+    version: 2
     type: prometheus
     access: proxy
-    url: http://observatory-api:8787
+    url: http://host.docker.internal:8788
     isDefault: true
     jsonData:
-      httpMethod: POST
+      httpMethod: GET
+      httpHeaderName1: Authorization
+    secureJsonData:
+      httpHeaderValue1: $__file{/run/secrets/observatory_api_authorization}
   # Collector self-metrics retain the real Prometheus backend and are kept
   # explicit on Reliability panels so telemetry-plane health remains visible.
   - name: Prometheus
