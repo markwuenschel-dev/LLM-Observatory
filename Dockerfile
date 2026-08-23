@@ -1,4 +1,4 @@
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -13,6 +13,6 @@ RUN python -m pip install --no-cache-dir . \
     && chown -R observatory:observatory /opt/observatory /var/lib/observatory
 
 USER observatory
-EXPOSE 8787
+EXPOSE 8787 8788
 
-CMD ["python", "-m", "observatory.cli", "--state-dir", "/var/lib/observatory", "run-api", "--host", "0.0.0.0", "--allow-remote", "--allow-insecure-remote", "--port", "8787"]
+CMD ["python", "-m", "observatory.cli", "--state-dir", "/var/lib/observatory", "run-api", "--host", "0.0.0.0", "--allow-remote", "--allow-insecure-remote", "--port", "8787", "--read-port", "8788"]

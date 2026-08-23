@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from observatory.cli import DEFAULT_OPERATION_TIMEOUT, _command_start, _inspect_live_compose_state, _snapshot_compose_images, build_parser, main
+from observatory.cli import DEFAULT_OPERATION_TIMEOUT, StatePaths, _command_start, _inspect_live_compose_state, _snapshot_compose_images, _start_host_api, build_parser, main
 
 from tests.test_contracts import event_mapping
 
@@ -22,12 +22,23 @@ class CliTests(unittest.TestCase):
 
     def test_start_reuses_local_images_without_forcing_a_rebuild(self) -> None:
         args = build_parser().parse_args(["--state-dir", tempfile.gettempdir(), "start"])
-        with patch("observatory.cli._compose", return_value=(0, "started")) as compose, patch(
+        with patch("observatory.cli._start_host_api", return_value=(True, "host API ready")), patch(
+            "observatory.cli._compose", return_value=(0, "started")
+        ) as compose, patch(
             "observatory.cli._wait_http", return_value=(True, "HTTP 200")
         ):
             result = _command_start(args)
-        self.assertEqual(result["outcome"], "success")
-        compose.assert_called_once_with(args, "up -d --wait")
+            self.assertEqual(result["outcome"], "success")
+            compose.assert_called_once_with(args, "up -d --wait")
+
+    def test_start_refuses_to_adopt_an_unmanaged_api(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            self.run_cli(["--state-dir", temp, "install"])
+            args = build_parser().parse_args(["--state-dir", temp, "start"])
+            with patch("observatory.cli._probe_http", return_value=(True, "HTTP 200")):
+                ready, detail = _start_host_api(args, StatePaths(Path(temp)))
+        self.assertFalse(ready)
+        self.assertIn("unmanaged host API", detail)
 
     def test_start_refuses_an_already_over_budget_backend(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -60,12 +71,16 @@ class CliTests(unittest.TestCase):
             self.assertTrue(Path(temp, "data", "events.sqlite3").exists())
             self.assertTrue(Path(temp, "compose.env").exists())
             self.assertTrue(Path(temp, "secrets", "grafana_admin_password").exists())
+            self.assertTrue(Path(temp, "secrets", "observatory_api_token").exists())
+            self.assertTrue(Path(temp, "secrets", "observatory_api_authorization").exists())
             self.assertNotIn(b"\r\n", Path(temp, "secrets", "grafana_admin_password").read_bytes())
             self.assertTrue(Path(temp, "secrets", "grafana_admin_password").read_bytes().endswith(b"\n"))
             self.assertIn("compose_file", json.loads(Path(temp, "config.json").read_text(encoding="utf-8")))
             compose_env = Path(temp, "compose.env").read_text(encoding="utf-8")
             self.assertIn("OBSERVATORY_STATE_DIR=", compose_env)
             self.assertIn("OBSERVATORY_SECRET_FILE=", compose_env)
+            self.assertIn("OBSERVATORY_API_TOKEN_FILE=", compose_env)
+            self.assertIn("OBSERVATORY_API_AUTHORIZATION_FILE=", compose_env)
             self.assertIn("OBSERVATORY_MAX_BACKEND_VOLUME_BYTES=", compose_env)
 
     def test_demo_seed_is_idempotent_and_populates_the_walkthrough(self) -> None:
@@ -322,7 +337,7 @@ class CliTests(unittest.TestCase):
     def test_update_pull_backups_before_compose_and_requires_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             self.run_cli(["--state-dir", temp, "install"])
-            with patch("observatory.cli._snapshot_compose_images", return_value=[{"id": "sha256:" + "a" * 64, "reference": "example/service:1"}]), patch("observatory.cli._compose", side_effect=[(0, "pulled"), (0, "started")]) as compose, patch("observatory.cli._wait_http", return_value=(True, "HTTP 200")):
+            with patch("observatory.cli._snapshot_compose_images", return_value=[{"id": "sha256:" + "a" * 64, "reference": "example/service:1"}]), patch("observatory.cli._stop_host_api", return_value=(True, "host API stopped")), patch("observatory.cli._start_host_api", return_value=(True, "HTTP 200")), patch("observatory.cli._compose", side_effect=[(0, "pulled"), (0, "started")]) as compose, patch("observatory.cli._wait_http", return_value=(True, "HTTP 200")):
                 code, result = self.run_cli(["--state-dir", temp, "--timeout", "1", "update", "--pull"])
             self.assertEqual(code, 0)
             self.assertEqual(result["data"]["readiness"], "HTTP 200")
@@ -339,7 +354,7 @@ class CliTests(unittest.TestCase):
                 side_effect=[(0, "pulled"), (5, "new stack failed"), (0, "rolled down"), (0, "rolled up")],
             ) as compose, patch("observatory.cli._restore_compose_images", return_value={"status": "success", "restored": ["example/service:1"]}), patch(
                 "observatory.cli._restore_update_database", return_value={"status": "success", "integrity": "ok"},
-            ), patch("observatory.cli._wait_http", return_value=(True, "HTTP 200")):
+            ), patch("observatory.cli._stop_host_api", return_value=(True, "host API stopped")), patch("observatory.cli._start_host_api", return_value=(True, "HTTP 200")), patch("observatory.cli._wait_http", return_value=(True, "HTTP 200")):
                 code, result = self.run_cli(["--state-dir", temp, "--timeout", "1", "update", "--pull"])
             self.assertEqual(code, 5)
             self.assertEqual(result["outcome"], "degraded")
@@ -356,7 +371,7 @@ class CliTests(unittest.TestCase):
             ) as compose, patch(
                 "observatory.cli._restore_compose_images",
                 return_value={"status": "success", "restored": ["example/service:1"]},
-            ), patch("observatory.cli._restore_update_database", return_value={"status": "success", "integrity": "ok"}), patch(
+            ), patch("observatory.cli._restore_update_database", return_value={"status": "success", "integrity": "ok"}), patch("observatory.cli._stop_host_api", return_value=(True, "host API stopped")), patch("observatory.cli._start_host_api", return_value=(True, "HTTP 200")), patch(
                 "observatory.cli._wait_http", return_value=(True, "HTTP 200")
             ):
                 code, result = self.run_cli(["--state-dir", temp, "--timeout", "1", "update", "--pull"])

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import socket
 import shutil
 import sqlite3
@@ -18,7 +19,7 @@ import subprocess
 import sys
 import time
 from typing import Any, Iterable, Mapping, Sequence
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import webbrowser
 
@@ -35,12 +36,14 @@ from .clients import (
 from .clock import utc_now
 from .contracts import ContractError, NormalizedEvent, canonical_json
 from .intake import Intake
-from .maintenance import backup_database, backup_state, inspect_backend_volume_capacity, purge_events, read_schema_versions, resolve_backend_volumes, restore_database, restore_state, schema_versions
+from .maintenance import backup_database, backup_state, enforce_normalized_retention, inspect_backend_volume_capacity, purge_events, read_schema_versions, resolve_backend_volumes, restore_database, restore_state, schema_versions
+from .observation import DEFAULT_FRESHNESS_SECONDS, DEFAULT_WINDOW_SECONDS, observation_report, window_start
 from .privacy import PrivacyPolicy, redact_event
+from .sessions import default_claude_projects_root, discover_sessions
 from .project import resolve_project
-from .outcomes import git_outcome_snapshot, make_outcome_event, run_command_outcome
+from .outcomes import ci_run_outcomes, git_commit_outcomes, git_outcome_snapshot, make_outcome_event, run_command_outcome
 from .hooks import build_hook_event
-from .store import DEFAULT_MAX_DATABASE_BYTES, EventStore
+from .store import DEFAULT_MAX_DATABASE_BYTES, MAINTENANCE_BUSY_TIMEOUT_MS, EventStore
 
 
 EXIT_OK = 0
@@ -61,16 +64,23 @@ DEFAULT_OPERATION_TIMEOUT = 180.0
 DEFAULT_MIN_FREE_BYTES = 1 * 1024 ** 3
 DEFAULT_MAX_BACKEND_VOLUME_BYTES = 16 * 1024 ** 3
 DEFAULT_COMPOSE_PROJECT = "llm-observatory"
+DEFAULT_API_READY_URL = "http://127.0.0.1:8787/readyz"
+DEFAULT_API_HEALTH_URL = "http://127.0.0.1:8787/healthz"
 DEFAULT_RETENTION = {
     "prometheus_days": 30,
     "prometheus_size": "8GB",
     "tempo_hours": 720,
     "loki_hours": 336,
-    "normalized_events": "operator-managed",
+    # The normalized store is now policy-bounded rather than purely manual;
+    # `retention --enforce` applies these through the audited purge path.
+    "normalized_events": "policy",
+    "normalized_target_ratio": 0.8,
+    "normalized_max_age_days": None,
 }
 DEFAULT_STORAGE = {
     "max_backend_volume_bytes": DEFAULT_MAX_BACKEND_VOLUME_BYTES,
     "min_free_bytes": DEFAULT_MIN_FREE_BYTES,
+    "max_database_bytes": DEFAULT_MAX_DATABASE_BYTES,
 }
 
 _COMPOSE_ROLLBACK_IMAGE_ID = re.compile(r"^(?:sha256:)?[0-9a-f]{12,64}$", re.IGNORECASE)
@@ -99,6 +109,22 @@ class StatePaths:
     @property
     def secret(self) -> Path:
         return self.root / "secrets" / "grafana_admin_password"
+
+    @property
+    def api_token(self) -> Path:
+        return self.root / "secrets" / "observatory_api_token"
+
+    @property
+    def api_authorization(self) -> Path:
+        return self.root / "secrets" / "observatory_api_authorization"
+
+    @property
+    def api_pid(self) -> Path:
+        return self.root / "api.pid.json"
+
+    @property
+    def api_log(self) -> Path:
+        return self.root / "api.log"
 
     @property
     def compose_env(self) -> Path:
@@ -187,7 +213,13 @@ def _storage_environment(storage: Mapping[str, Any] | None) -> dict[str, str]:
     value = values.get("max_backend_volume_bytes")
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         value = DEFAULT_MAX_BACKEND_VOLUME_BYTES
-    return {"OBSERVATORY_MAX_BACKEND_VOLUME_BYTES": str(value)}
+    database = values.get("max_database_bytes")
+    if not isinstance(database, int) or isinstance(database, bool) or database <= 0:
+        database = DEFAULT_MAX_DATABASE_BYTES
+    return {
+        "OBSERVATORY_MAX_BACKEND_VOLUME_BYTES": str(value),
+        "OBSERVATORY_MAX_DATABASE_BYTES": str(database),
+    }
 
 
 def _reconcile_compose_env(
@@ -200,6 +232,8 @@ def _reconcile_compose_env(
     desired = {
         "OBSERVATORY_STATE_DIR": paths.root.resolve().as_posix(),
         "OBSERVATORY_SECRET_FILE": paths.secret.resolve().as_posix(),
+        "OBSERVATORY_API_TOKEN_FILE": paths.api_token.resolve().as_posix(),
+        "OBSERVATORY_API_AUTHORIZATION_FILE": paths.api_authorization.resolve().as_posix(),
     }
     desired.update(_retention_environment(retention))
     desired.update(_storage_environment(storage))
@@ -266,6 +300,226 @@ def _probe_http(url: str, timeout: float = 0.5) -> tuple[bool, str]:
             return 200 <= response.status < 400, f"HTTP {response.status}"
     except (OSError, URLError, ValueError) as exc:
         return False, str(exc)
+
+
+def _probe_json(url: str, timeout: float = 0.5) -> tuple[bool, dict[str, Any] | None, str]:
+    try:
+        request = Request(url, method="GET")
+        with urlopen(request, timeout=timeout) as response:
+            value = json.loads(response.read(16 * 1024).decode("utf-8"))
+            return True, value if isinstance(value, dict) else None, f"HTTP {response.status}"
+    except HTTPError as exc:
+        try:
+            value = json.loads(exc.read(16 * 1024).decode("utf-8"))
+            return True, value if isinstance(value, dict) else None, f"HTTP {exc.code}"
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return True, None, f"HTTP {exc.code}"
+    except (OSError, URLError, ValueError) as exc:
+        return False, None, str(exc)
+
+
+def _windows_pid_alive(pid: int) -> bool:
+    """Liveness for a Windows process, including a detached one.
+
+    `os.kill(pid, 0)` is POSIX semantics. On Windows it raises
+    `OSError: [WinError 87]` for a process started with DETACHED_PROCESS -- which
+    is exactly how the managed host API is launched -- so the generic check
+    reports a healthy API as dead. `stop`/`uninstall`/`update`/`restore` then
+    discard the process record and orphan a live API still holding its ports.
+    Query the process object directly instead.
+    """
+
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # ERROR_ACCESS_DENIED means the pid exists but is not ours to inspect;
+        # treat it as alive so we never silently orphan a running process.
+        return ctypes.get_last_error() == 5
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _api_pid_alive(pid: int) -> bool:
+    if pid < 1:
+        return False
+    if os.name == "nt":
+        try:
+            return _windows_pid_alive(pid)
+        except (OSError, AttributeError, ValueError):
+            # Never claim a process is gone because the probe itself failed.
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _api_record(paths: StatePaths) -> dict[str, Any] | None:
+    if not paths.api_pid.exists():
+        return None
+    try:
+        value = json.loads(paths.api_pid.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _managed_api_url(paths: StatePaths, fallback: str) -> str:
+    """Use a recorded custom control URL for lifecycle cleanup when present."""
+
+    if fallback not in {DEFAULT_API_READY_URL, DEFAULT_API_HEALTH_URL}:
+        return fallback
+    record = _api_record(paths)
+    candidate = record.get("control_url") if isinstance(record, dict) else None
+    if not isinstance(candidate, str) or not candidate.strip():
+        return fallback
+    candidate = candidate.strip()
+    if fallback == DEFAULT_API_HEALTH_URL and candidate.endswith("/readyz"):
+        return candidate[:-len("/readyz")] + "/healthz"
+    return candidate
+
+
+def _start_host_api(args: argparse.Namespace, paths: StatePaths) -> tuple[bool, str]:
+    api_url = getattr(args, "api_url", "http://127.0.0.1:8787/readyz")
+    api_port = int(getattr(args, "api_port", 8787))
+    read_port = int(getattr(args, "read_port", 8788))
+    if api_port != 8787 and api_url == "http://127.0.0.1:8787/readyz":
+        api_url = f"http://127.0.0.1:{api_port}/readyz"
+    read_url = getattr(args, "read_url", f"http://127.0.0.1:{read_port}/readz")
+    if read_port != 8788 and read_url == "http://127.0.0.1:8788/readz":
+        read_url = f"http://127.0.0.1:{read_port}/readz"
+    record = _api_record(paths)
+    ready, detail = _probe_http(api_url, timeout=min(args.timeout, 2.0))
+    if ready:
+        if record is None:
+            return False, "an unmanaged host API is already reachable; refusing to adopt it"
+        pid = record.get("pid")
+        if not isinstance(pid, int) or not _api_pid_alive(pid):
+            paths.api_pid.unlink(missing_ok=True)
+            return False, "an unmanaged host API is already reachable; refusing to adopt it"
+        identity_ok, payload, identity_detail = _probe_json(api_url, timeout=min(args.timeout, 2.0))
+        if not identity_ok or not payload or payload.get("process_id") != pid:
+            return False, f"host API identity mismatch for recorded process {pid} ({identity_detail})"
+        return True, f"host API already ready ({detail})"
+    if record is not None:
+        pid = record.get("pid")
+        if isinstance(pid, int) and _api_pid_alive(pid):
+            ready, detail = _wait_http(api_url, timeout=args.timeout)
+            return ready, detail if ready else f"managed host API process {pid} did not become ready: {detail}"
+        paths.api_pid.unlink(missing_ok=True)
+    if not paths.api_token.exists():
+        return False, f"host API token is missing at {paths.api_token}; run observatory install"
+    command = [
+        sys.executable,
+        "-m",
+        "observatory.cli",
+        "--state-dir",
+        str(paths.root),
+        "run-api",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(api_port),
+        "--read-port",
+        str(read_port),
+        "--allow-remote",
+        "--auth-token-file",
+        str(paths.api_token),
+        "--trust-loopback",
+        "--max-database-bytes",
+        str(_database_limit_for(paths)),
+    ]
+    paths.api_log.parent.mkdir(parents=True, exist_ok=True)
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+    with paths.api_log.open("a", encoding="utf-8", newline="\n") as log:
+        process = subprocess.Popen(
+            command,
+            cwd=str(Path.cwd()),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            creationflags=creationflags,
+            start_new_session=os.name != "nt",
+        )
+    _write_json_atomic(
+        paths.api_pid,
+        {
+            "pid": process.pid,
+            "started_at": utc_now().isoformat(),
+            "control_url": api_url,
+            "read_url": read_url,
+        },
+    )
+    ready, detail = _wait_http(api_url, timeout=args.timeout)
+    if not ready:
+        _stop_host_api(paths, api_url=api_url, timeout=min(args.timeout, 10.0), allow_unready=True)
+        return False, f"host API did not become ready: {detail}"
+    return True, f"host API started (pid {process.pid})"
+
+
+def _stop_host_api(
+    paths: StatePaths,
+    *,
+    api_url: str,
+    timeout: float,
+    allow_unready: bool = False,
+) -> tuple[bool, str]:
+    record = _api_record(paths)
+    api_url = _managed_api_url(paths, api_url)
+    if record is None:
+        reachable, _detail = _probe_http(api_url, timeout=min(timeout, 2.0))
+        if reachable:
+            return False, "an unmanaged host API is reachable; refusing to terminate it"
+        return True, "host API not managed by this state directory"
+    pid = record.get("pid")
+    if not isinstance(pid, int) or not _api_pid_alive(pid):
+        paths.api_pid.unlink(missing_ok=True)
+        return True, "removed stale host API process record"
+    reachable, payload, detail = _probe_json(api_url, timeout=min(timeout, 2.0))
+    if reachable and payload and payload.get("process_id") != pid and not allow_unready:
+        return False, f"host API identity mismatch for recorded process {pid} ({detail})"
+    if not reachable and not allow_unready:
+        return False, f"could not verify recorded host API process {pid}: {detail}"
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        return False, f"could not stop host API process {pid}: {exc}"
+    deadline = time.monotonic() + max(1.0, min(timeout, 15.0))
+    while _api_pid_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if _api_pid_alive(pid):
+        return False, f"host API process {pid} did not stop within the timeout"
+    paths.api_pid.unlink(missing_ok=True)
+    return True, f"host API process {pid} stopped"
 
 
 def _path_key(value: str | Path) -> str:
@@ -433,7 +687,14 @@ def _storage_bytes(path: Path) -> int:
     return total
 
 
-def _configured_database_limit() -> int:
+def _configured_database_limit(storage: Mapping[str, Any] | None = None) -> int:
+    """Resolve the normalized-store budget.
+
+    An explicit environment override wins so an operator can widen the bound
+    for one run; otherwise the installed policy is authoritative, which is
+    what makes a raised budget survive a restart.
+    """
+
     raw = os.environ.get("OBSERVATORY_MAX_DATABASE_BYTES")
     if raw:
         try:
@@ -442,7 +703,22 @@ def _configured_database_limit() -> int:
                 return value
         except ValueError:
             pass
+    if isinstance(storage, Mapping):
+        configured = storage.get("max_database_bytes")
+        if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
+            return configured
     return DEFAULT_MAX_DATABASE_BYTES
+
+
+def _database_limit_for(paths: StatePaths) -> int:
+    """Budget for an installed state directory, tolerant of unreadable config."""
+
+    try:
+        config = _load_config(paths) or {}
+    except RuntimeError:
+        config = {}
+    storage = config.get("storage")
+    return _configured_database_limit(storage if isinstance(storage, Mapping) else None)
 
 
 def _configured_backend_volume_limit(storage: Mapping[str, Any] | None = None) -> int:
@@ -462,7 +738,9 @@ def _configured_backend_volume_limit(storage: Mapping[str, Any] | None = None) -
 
 
 def _event_store(paths: StatePaths) -> EventStore:
-    return EventStore(paths.database, max_bytes=_configured_database_limit())
+    # CLI writers are maintenance, not intake: waiting is correct, silently
+    # dropping what was collected is not.
+    return EventStore(paths.database, max_bytes=_database_limit_for(paths), busy_timeout_ms=MAINTENANCE_BUSY_TIMEOUT_MS)
 
 
 def _command_install(args: argparse.Namespace) -> dict[str, Any]:
@@ -488,8 +766,21 @@ def _command_install(args: argparse.Namespace) -> dict[str, Any]:
         # Keep the mounted secret LF-only so Grafana does not receive a trailing CR.
         with paths.secret.open("w", encoding="utf-8", newline="\n") as secret_file:
             secret_file.write(secrets.token_urlsafe(32) + "\n")
+    api_token_created = not paths.api_token.exists() or paths.api_token.stat().st_size == 0
+    if api_token_created:
+        api_token = secrets.token_urlsafe(32)
+        with paths.api_token.open("w", encoding="utf-8", newline="\n") as token_file:
+            token_file.write(api_token + "\n")
+    else:
+        api_token = _read_api_token(str(paths.api_token))
+        if api_token is None:
+            raise ValueError(f"API token file is empty: {paths.api_token}")
+    if not paths.api_authorization.exists() or paths.api_authorization.stat().st_size == 0 or api_token_created:
+        with paths.api_authorization.open("w", encoding="utf-8", newline="\n") as authorization_file:
+            authorization_file.write(f"Bearer {api_token}\n")
     try:
-        os.chmod(paths.secret, 0o600)
+        for secret_path in (paths.secret, paths.api_token, paths.api_authorization):
+            os.chmod(secret_path, 0o600)
     except OSError:
         # Windows ACLs govern the file there; do not make install fail when
         # chmod is unsupported, while Unix profiles still get a private mode.
@@ -543,6 +834,7 @@ def _command_install(args: argparse.Namespace) -> dict[str, Any]:
             "state_dir": str(paths.root),
             "changed": changed,
             "secret_created": secret_created,
+            "api_token_created": api_token_created,
             "database": str(paths.database),
             "schema_versions": versions,
             "content_capture": False,
@@ -591,6 +883,8 @@ def _command_doctor(args: argparse.Namespace) -> dict[str, Any]:
     checks.append({"id": "compose.file", "status": "pass" if compose.exists() else "warn", "blocking": False, "path": str(compose)})
     checks.append({"id": "state.compose_env", "status": "pass" if paths.compose_env.exists() else "fail", "blocking": True})
     checks.append({"id": "state.grafana_secret", "status": "pass" if paths.secret.exists() else "fail", "blocking": True})
+    checks.append({"id": "state.api_token", "status": "pass" if paths.api_token.exists() else "fail", "blocking": True})
+    checks.append({"id": "state.api_authorization", "status": "pass" if paths.api_authorization.exists() else "fail", "blocking": True})
     checks.append({"id": "state.database", "status": "pass" if paths.database.exists() else "fail", "blocking": True})
     try:
         integrity = _read_only_integrity(paths.database)
@@ -601,7 +895,11 @@ def _command_doctor(args: argparse.Namespace) -> dict[str, Any]:
         compose_env = paths.compose_env.read_text(encoding="utf-8")
         env_matches_state = f"OBSERVATORY_STATE_DIR={paths.root.resolve().as_posix()}" in compose_env
         env_matches_secret = f"OBSERVATORY_SECRET_FILE={paths.secret.resolve().as_posix()}" in compose_env
-        checks.append({"id": "state.compose_env_alignment", "status": "pass" if env_matches_state and env_matches_secret else "fail", "blocking": True})
+        env_matches_api = (
+            f"OBSERVATORY_API_TOKEN_FILE={paths.api_token.resolve().as_posix()}" in compose_env
+            and f"OBSERVATORY_API_AUTHORIZATION_FILE={paths.api_authorization.resolve().as_posix()}" in compose_env
+        )
+        checks.append({"id": "state.compose_env_alignment", "status": "pass" if env_matches_state and env_matches_secret and env_matches_api else "fail", "blocking": True})
     live_compose = _inspect_live_compose_state(paths.root)
     checks.append({
         "id": "compose.live_state",
@@ -623,7 +921,7 @@ def _command_doctor(args: argparse.Namespace) -> dict[str, Any]:
     except OSError as exc:
         warnings.append(f"could not inspect state-disk capacity: {exc}")
     database_bytes = _storage_bytes(paths.database)
-    database_limit = _configured_database_limit()
+    database_limit = _database_limit_for(paths)
     database_ratio = database_bytes / database_limit
     database_status = "fail" if database_ratio >= 1 else "warn" if database_ratio >= 0.9 else "pass"
     checks.append({"id": "state.database_capacity", "status": database_status, "blocking": False, "bytes": database_bytes, "max_bytes": database_limit, "ratio": database_ratio})
@@ -653,6 +951,7 @@ def _command_doctor(args: argparse.Namespace) -> dict[str, Any]:
         warnings.append(f"client capability discovery is incomplete: {exc}")
     for service_id, url in (
         ("service.api", "http://127.0.0.1:8787/readyz"),
+        ("service.read_api", "http://127.0.0.1:8788/readz"),
         ("service.collector", "http://127.0.0.1:13133/"),
         ("service.grafana", "http://127.0.0.1:3000/api/health"),
     ):
@@ -662,7 +961,13 @@ def _command_doctor(args: argparse.Namespace) -> dict[str, Any]:
             warnings.append(f"{service_id} is not reachable at {url}")
     if not compose.exists():
         warnings.append(f"Compose file not found at {compose}; lifecycle commands are unavailable")
-    if not paths.compose_env.exists() or not paths.secret.exists() or not paths.database.exists():
+    if (
+        not paths.compose_env.exists()
+        or not paths.secret.exists()
+        or not paths.api_token.exists()
+        or not paths.api_authorization.exists()
+        or not paths.database.exists()
+    ):
         warnings.append("generated Compose state is incomplete; run observatory install to reconcile it")
     try:
         compose_probe = subprocess.run(["docker", "compose", "version"], check=False, capture_output=True, text=True, timeout=5)
@@ -1063,6 +1368,10 @@ def _command_run_outcome(args: argparse.Namespace) -> dict[str, Any]:
             project_path=args.project_path,
             kind=args.kind,
             correlation_id=args.correlation_id,
+            correlation_basis=args.correlation_basis,
+            task_id=args.task_id,
+            task_class=args.task_class,
+            session_id=args.session_id,
             evidence_source=args.evidence_source,
             timeout_seconds=args.command_timeout,
         )
@@ -1091,7 +1400,14 @@ def _command_git_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     if not paths.config.exists():
         return _result("git-snapshot", "not_initialized", EXIT_NOT_INITIALIZED, errors=["run observatory install first"])
     try:
-        event = git_outcome_snapshot(args.project_path, correlation_id=args.correlation_id)
+        event = git_outcome_snapshot(
+            args.project_path,
+            correlation_id=args.correlation_id,
+            correlation_basis=args.correlation_basis,
+            task_id=args.task_id,
+            task_class=args.task_class,
+            session_id=args.session_id,
+        )
     except (OSError, ValueError, RuntimeError) as exc:
         return _result("git-snapshot", "failed", EXIT_FAILED, errors=[str(exc)])
     event = redact_event(event)
@@ -1145,13 +1461,58 @@ def _command_retention(args: argparse.Namespace) -> dict[str, Any]:
         for key, value in requested.items():
             if value < 1:
                 raise ValueError(f"{key} must be at least 1")
+        if args.normalized_target_ratio is not None:
+            if not 0 < args.normalized_target_ratio <= 1:
+                raise ValueError("normalized-target-ratio must be greater than 0 and at most 1")
+            requested["normalized_target_ratio"] = args.normalized_target_ratio
+        if args.normalized_max_age_days is not None:
+            if args.normalized_max_age_days < 1:
+                raise ValueError("normalized-max-age-days must be at least 1")
+            requested["normalized_max_age_days"] = args.normalized_max_age_days
         updated = {**DEFAULT_RETENTION, **current, **requested}
-        changed = updated != current
-        env_changed = _reconcile_compose_env(paths, updated, config.get("storage"))
+        storage = config.get("storage")
+        storage = dict(storage) if isinstance(storage, Mapping) else dict(DEFAULT_STORAGE)
+        storage_changed = False
+        if args.max_database_bytes is not None:
+            if args.max_database_bytes < 1:
+                raise ValueError("max-database-bytes must be a positive integer")
+            storage_changed = storage.get("max_database_bytes") != args.max_database_bytes
+            storage["max_database_bytes"] = args.max_database_bytes
+        elif "max_database_bytes" not in storage:
+            # Older installs predate the durable budget; adopt the default so the
+            # value stops living only in the launching process environment.
+            storage["max_database_bytes"] = DEFAULT_MAX_DATABASE_BYTES
+            storage_changed = True
+        changed = updated != current or storage_changed
+        env_changed = _reconcile_compose_env(paths, updated, storage)
         if changed:
             config["retention"] = updated
+            config["storage"] = storage
             _write_json_atomic(paths.config, config)
-        return _result("retention", "success", EXIT_OK, data={"retention": updated, "changed": changed or env_changed, "compose_env": str(paths.compose_env)})
+        data: dict[str, Any] = {
+            "retention": updated,
+            "storage": storage,
+            "changed": changed or env_changed,
+            "compose_env": str(paths.compose_env),
+        }
+        if args.enforce:
+            limit = _configured_database_limit(storage)
+            with _event_store(paths) as store:
+                enforcement = enforce_normalized_retention(
+                    store,
+                    max_bytes=limit,
+                    target_ratio=float(updated.get("normalized_target_ratio") or 0.8),
+                    max_age_days=updated.get("normalized_max_age_days"),
+                )
+            data["enforcement"] = enforcement
+            # Enforcement that left the store over budget is a degraded run, not
+            # a successful one: printing "success" and exiting 0 hid it from
+            # every consumer except a --json reader who knew to look inside
+            # data.enforcement.outcome -- and this runs unattended.
+            blocker = enforcement.get("blocker")
+            if blocker:
+                return _result("retention", "degraded", EXIT_DEGRADED, data=data, warnings=[str(blocker)])
+        return _result("retention", "success", EXIT_OK, data=data)
     except (OSError, RuntimeError, ValueError) as exc:
         return _result("retention", "failed", EXIT_FAILED, errors=[str(exc)])
 
@@ -1193,7 +1554,15 @@ def _command_restore(args: argparse.Namespace) -> dict[str, Any]:
         return _result("restore", "not_initialized", EXIT_NOT_INITIALIZED, errors=["run observatory install first"])
     if args.backend_volumes and not args.full_state:
         return _result("restore", "failed", EXIT_USAGE, errors=["--backend-volumes requires --full-state"])
-    api_reachable, api_detail = _probe_http(args.api_health_url, timeout=min(args.timeout, 2.0))
+    api_health_url = _managed_api_url(paths, args.api_health_url)
+    api_stopped, api_stop_detail = _stop_host_api(
+        paths,
+        api_url=api_health_url,
+        timeout=args.timeout,
+    )
+    if not api_stopped:
+        return _result("restore", "conflict", EXIT_CONFLICT, data={"api": api_stop_detail}, errors=[api_stop_detail])
+    api_reachable, api_detail = _probe_http(api_health_url, timeout=min(args.timeout, 2.0))
     if api_reachable:
         return _result(
             "restore",
@@ -1262,10 +1631,239 @@ def _command_prune(args: argparse.Namespace) -> dict[str, Any]:
         return _result("prune", "not_initialized", EXIT_NOT_INITIALIZED, errors=["run observatory install first"])
     try:
         with _event_store(paths) as store:
-            result = purge_events(store, before=args.before, event_ids=args.event_id, confirm=args.confirm)
+            # An operator running `prune` explicitly expects the space back.
+            result = purge_events(store, before=args.before, event_ids=args.event_id, confirm=args.confirm, compact=True)
         return _result("prune", "success", EXIT_OK, data=result)
     except (OSError, RuntimeError, ValueError) as exc:
         return _result("prune", "failed", EXIT_FAILED, errors=[str(exc)])
+
+
+def _command_observe(args: argparse.Namespace) -> dict[str, Any]:
+    """Report whether Observatory is actually observing, and for which clients.
+
+    Distinct from `status`, which probes service endpoints: a stack can pass
+    every health check while persisting nothing. This asks the store what it has
+    actually received, so a silent telemetry gap surfaces as a verdict instead of
+    being discovered days later.
+    """
+
+    paths = _paths(args)
+    if not paths.config.exists():
+        return _result("observe", "not_initialized", EXIT_NOT_INITIALIZED, errors=["run observatory install first"])
+    window_seconds = max(60, int(args.window_hours) * 3600)
+    freshness_seconds = max(60, int(args.freshness_hours) * 3600)
+    try:
+        config = _load_config(paths) or {}
+    except RuntimeError as exc:
+        return _result("observe", "conflict", EXIT_CONFLICT, errors=[str(exc)])
+    try:
+        store = EventStore(
+            paths.database,
+            max_bytes=_database_limit_for(paths),
+            # Only --record writes; --history is a pure read, and opening
+            # read-write runs migrations and the projection backfill.
+            read_only=not args.record,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        report = observation_report(
+            {},
+            configured_clients=config.get("managed_clients", {}),
+            store_health={"reachable": False, "error": str(exc)},
+            window_seconds=window_seconds,
+            freshness_seconds=freshness_seconds,
+        )
+        return _result("observe", "degraded", EXIT_DEGRADED, data=report, warnings=report["blockers"])
+    try:
+        samples = store.observation_samples(window_start(window_seconds))
+        recent = store.observation_samples(window_start(freshness_seconds))
+        lifetime = store.client_lifetime()
+        health = {"reachable": True, **store.capacity()}
+        report = observation_report(
+            samples,
+            recent_samples=recent,
+            lifetime_totals=lifetime,
+            configured_clients=config.get("managed_clients", {}),
+            store_health=health,
+            window_seconds=window_seconds,
+            freshness_seconds=freshness_seconds,
+        )
+        if args.record:
+            report["snapshot_id"] = store.record_observation(report)
+        if args.history:
+            report["history"] = store.observation_history(
+                since=window_start(max(3600, int(args.history_hours) * 3600)), limit=500
+            )
+            history_since = window_start(max(3600, int(args.history_hours) * 3600))
+            report["reliability"] = store.observation_gaps(
+                since=history_since,
+                expected_interval_seconds=max(60, int(args.expected_interval_minutes) * 60),
+            )
+            # Schema drift is quiet: a field simply stops arriving. Comparing a
+            # family against its own recent baseline makes that visible.
+            report["coverage_drift"] = store.coverage_drift(since=history_since)
+    finally:
+        store.close()
+    capable = bool(report["observation_capable"])
+    return _result(
+        "observe",
+        "success" if capable else "degraded",
+        EXIT_OK if capable else EXIT_DEGRADED,
+        data=report,
+        warnings=[] if capable else report["blockers"],
+    )
+
+
+def _command_collect_outcomes(args: argparse.Namespace) -> dict[str, Any]:
+    """Observe engineering outcomes across every project already known.
+
+    Without this the outcome surface stays empty unless a human remembers to
+    record something, so no amount of elapsed time would ever produce a
+    comparison. Projects come from the same host-level session directory used
+    for attribution, so no repository is discovered, modified, or given a hook.
+    """
+
+    paths = _paths(args)
+    if not paths.config.exists():
+        return _result("collect-outcomes", "not_initialized", EXIT_NOT_INITIALIZED, errors=["run observatory install first"])
+    since = (utc_now() - timedelta(hours=max(1, int(args.since_hours)))).isoformat()
+    roots: list[str] = []
+    seen: set[str] = set()
+    try:
+        for session in discover_sessions(Path(args.root) if args.root else None):
+            if session.project_root not in seen:
+                seen.add(session.project_root)
+                roots.append(session.project_root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return _result("collect-outcomes", "failed", EXIT_FAILED, errors=[str(exc)])
+
+    window = max(60, int(args.window_minutes) * 60)
+    per_project: list[dict[str, Any]] = []
+    events: list[NormalizedEvent] = []
+    for root in roots:
+        commits: list[NormalizedEvent] = []
+        runs: list[NormalizedEvent] = []
+        try:
+            commits = git_commit_outcomes(root, since=since, window_seconds=window)
+        except (OSError, RuntimeError, ValueError):
+            commits = []
+        if not args.no_ci:
+            # CI is the one widely available source of a genuine pass/fail
+            # result. Commits say work landed, never whether it worked, so a
+            # store fed only by commits can never produce a success rate.
+            try:
+                runs = ci_run_outcomes(root, since=since, window_seconds=window)
+            except (OSError, RuntimeError, ValueError):
+                runs = []
+        if commits or runs:
+            per_project.append({"project_root": root, "commits": len(commits), "ci_runs": len(runs)})
+            events.extend(commits)
+            events.extend(runs)
+    data: dict[str, Any] = {
+        "projects_scanned": len(roots),
+        "projects_with_commits": len(per_project),
+        "commits_observed": sum(int(row["commits"]) for row in per_project),
+        "ci_runs_observed": sum(int(row["ci_runs"]) for row in per_project),
+        "outcomes_observed": len(events),
+        "since": since,
+        "applied": False,
+        "reads": "read-only git log; commit messages, author identities, and file paths are never retained",
+    }
+    if not args.apply:
+        data["detail"] = per_project
+        return _result(
+            "collect-outcomes",
+            "planned",
+            EXIT_DEGRADED,
+            data=data,
+            warnings=["plan only; pass --apply to record the observed outcomes"],
+        )
+    inserted = duplicate = failed = 0
+    failures: list[str] = []
+    with _event_store(paths) as store:
+        for event in events:
+            try:
+                result = store.append(redact_event(event))
+            except Exception as exc:
+                # Swallowing this and still returning success meant a busy store
+                # could drop every collected outcome while the command reported
+                # `inserted: 0` and exit 0 -- indistinguishable from "nothing to
+                # collect". Count it and degrade.
+                failed += 1
+                if len(failures) < 5:
+                    failures.append(f"{type(exc).__name__}: {exc}")
+                continue
+            if result.status == "inserted":
+                inserted += 1
+            elif result.status == "duplicate":
+                duplicate += 1
+    data.update({
+        "applied": True, "inserted": inserted, "duplicate": duplicate,
+        "failed": failed, "detail": per_project,
+    })
+    if args.recorrelate:
+        with _event_store(paths) as store:
+            data["recorrelated"] = store.recorrelate_outcomes()
+    if failed:
+        return _result(
+            "collect-outcomes", "degraded", EXIT_DEGRADED, data=data,
+            errors=failures,
+            warnings=[f"{failed} of {len(events)} observed outcomes could not be stored"],
+        )
+    return _result("collect-outcomes", "success", EXIT_OK, data=data)
+
+
+def _command_bind_sessions(args: argparse.Namespace) -> dict[str, Any]:
+    """Bind sessions to projects from the client's own session directory.
+
+    Native OTLP telemetry reports a session but no working directory, so it
+    cannot say which repository a session belonged to. The client already
+    records that association on the host, one directory per project, and reading
+    it needs no configuration in any client and touches no observed repository.
+    Only directory and file *names* are read; session transcripts contain
+    prompts and completions and are never opened.
+    """
+
+    paths = _paths(args)
+    if not paths.config.exists():
+        return _result("bind-sessions", "not_initialized", EXIT_NOT_INITIALIZED, errors=["run observatory install first"])
+    root = Path(args.root) if args.root else default_claude_projects_root()
+    try:
+        discovered = list(discover_sessions(root))
+    except (OSError, RuntimeError, ValueError) as exc:
+        return _result("bind-sessions", "failed", EXIT_FAILED, errors=[str(exc)])
+    projects: dict[str, int] = {}
+    for session in discovered:
+        projects[session.project.project_id] = projects.get(session.project.project_id, 0) + 1
+    data: dict[str, Any] = {
+        "root": str(root),
+        "discovered_sessions": len(discovered),
+        "projects": len(projects),
+        "applied": False,
+        "bound": 0,
+        "already_bound": 0,
+        "reads": "directory and file names only; session contents are never opened",
+    }
+    if not args.apply:
+        return _result(
+            "bind-sessions",
+            "planned",
+            EXIT_DEGRADED,
+            data=data,
+            warnings=["plan only; pass --apply to record the session-to-project bindings"],
+        )
+    bound = 0
+    with _event_store(paths) as store:
+        for session in discovered:
+            if store.bind_session_project(
+                session.session_id,
+                session.project,
+                evidence_source=session.evidence_source,
+            ):
+                bound += 1
+    data["applied"] = True
+    data["bound"] = bound
+    data["already_bound"] = len(discovered) - bound
+    return _result("bind-sessions", "success", EXIT_OK, data=data)
 
 
 def _command_resolve_project(args: argparse.Namespace) -> dict[str, Any]:
@@ -1485,6 +2083,12 @@ def _rollback_update(args: argparse.Namespace, paths: StatePaths, backup: Mappin
     """Attempt a bounded image/database rollback after an update failure."""
 
     rollback: dict[str, Any] = {"status": "incomplete", "steps": {}}
+    api_stopped, api_stop_detail = _stop_host_api(
+        paths,
+        api_url=getattr(args, "api_url", "http://127.0.0.1:8787/readyz"),
+        timeout=args.timeout,
+    )
+    rollback["steps"]["api_stop"] = {"status": "success" if api_stopped else "failed", "detail": api_stop_detail}
     down_code, down_detail = _compose(args, "down --remove-orphans")
     rollback["steps"]["stack_stop"] = {"status": "success" if down_code == EXIT_OK else "failed", "detail": down_detail}
 
@@ -1503,8 +2107,11 @@ def _rollback_update(args: argparse.Namespace, paths: StatePaths, backup: Mappin
     if up_code == EXIT_OK:
         readiness: dict[str, str] = {}
         ready = True
+        api_ready, api_detail = _start_host_api(args, paths)
+        readiness["api"] = api_detail
+        ready = ready and api_ready
         for name, url in (
-            ("api", "http://127.0.0.1:8787/readyz"),
+            ("read_api", getattr(args, "read_url", "http://127.0.0.1:8788/readz")),
             ("collector", "http://127.0.0.1:13133/"),
             ("grafana", "http://127.0.0.1:3000/api/health"),
         ):
@@ -1517,7 +2124,8 @@ def _rollback_update(args: argparse.Namespace, paths: StatePaths, backup: Mappin
     database_status = rollback["steps"]["database"].get("status")
     stack_status = rollback["steps"]["stack_restart"].get("status")
     readiness_status = rollback["steps"].get("readiness", {}).get("status", "failed")
-    if all(status == "success" for status in (image_status, database_status, stack_status, readiness_status)):
+    api_stop_status = rollback["steps"]["api_stop"].get("status")
+    if all(status == "success" for status in (api_stop_status, image_status, database_status, stack_status, readiness_status)):
         rollback["status"] = "success"
     return rollback
 
@@ -1541,12 +2149,21 @@ def _command_start(args: argparse.Namespace) -> dict[str, Any]:
             data={"capacity": capacity},
             warnings=["Observatory backend volumes exceed their configured budget; reduce retention or back up and prune before starting"],
         )
+    host_ready, host_detail = _start_host_api(args, paths)
+    readiness: dict[str, str] = {"api": host_detail}
+    if not host_ready:
+        return _result(
+            "start",
+            "degraded",
+            EXIT_DEGRADED,
+            data={"capacity": capacity, "readiness": readiness},
+            warnings=[f"api did not become ready: {host_detail}"],
+        )
     code, message = _compose(args, "up -d --wait")
     if code != EXIT_OK:
-        return _result("start", "degraded", code, data={"message": message, "capacity": capacity})
-    readiness: dict[str, str] = {}
+        return _result("start", "degraded", code, data={"message": message, "capacity": capacity, "readiness": readiness})
     for name, url in (
-        ("api", getattr(args, "api_url", "http://127.0.0.1:8787/readyz")),
+        ("read_api", getattr(args, "read_url", "http://127.0.0.1:8788/readz")),
         ("collector", getattr(args, "collector_url", "http://127.0.0.1:13133/")),
         ("grafana", getattr(args, "grafana_url", "http://127.0.0.1:3000/api/health")),
     ):
@@ -1555,6 +2172,20 @@ def _command_start(args: argparse.Namespace) -> dict[str, Any]:
         if not ready:
             return _result("start", "degraded", EXIT_DEGRADED, data={"message": message, "readiness": readiness, "capacity": capacity}, warnings=[f"{name} did not become ready: {detail}"])
     return _result("start", "success", EXIT_OK, data={"message": message, "readiness": readiness, "capacity": capacity})
+
+
+def _command_stop(args: argparse.Namespace) -> dict[str, Any]:
+    paths = _paths(args)
+    api_ok, api_detail = _stop_host_api(
+        paths,
+        api_url=getattr(args, "api_url", "http://127.0.0.1:8787/readyz"),
+        timeout=args.timeout,
+    )
+    if not api_ok:
+        return _result("stop", "conflict", EXIT_CONFLICT, data={"api": api_detail}, errors=[api_detail])
+    code, message = _compose(args, "stop")
+    outcome = "success" if code == EXIT_OK else "degraded"
+    return _result("stop", outcome, code, data={"message": message, "api": api_detail})
 
 
 def _command_update(args: argparse.Namespace) -> dict[str, Any]:
@@ -1570,25 +2201,36 @@ def _command_update(args: argparse.Namespace) -> dict[str, Any]:
         return _result("update", "success", EXIT_OK, data={"check": True, "schema_versions": versions, "changed": False, "image_pull": "not_requested"})
     if not args.pull:
         return _result("update", "degraded", EXIT_DEGRADED, data={"check": False, "schema_versions": versions, "changed": False, "image_pull": "not_requested"}, warnings=["local migrations are current; pass --pull to request an explicit Compose image update"])
+    api_stopped, api_stop_detail = _stop_host_api(
+        paths,
+        api_url=getattr(args, "api_url", "http://127.0.0.1:8787/readyz"),
+        timeout=args.timeout,
+    )
+    if not api_stopped:
+        return _result("update", "conflict", EXIT_CONFLICT, data={"api": api_stop_detail}, errors=[api_stop_detail])
     backup_target = paths.root / "backups" / f"pre-update-{utc_now().strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
     try:
         pre_update_backup = backup_database(paths.database, backup_target)
     except (OSError, RuntimeError, ValueError) as exc:
+        api_restarted, api_restart_detail = _start_host_api(args, paths)
         return _result(
             "update",
             "failed",
             EXIT_FAILED,
-            data={"schema_versions": versions, "changed": False, "image_pull": "not_started"},
+            data={"schema_versions": versions, "changed": False, "image_pull": "not_started", "api_restart": api_restart_detail},
+            warnings=[] if api_restarted else [f"host API restart after update preflight failure was unsuccessful: {api_restart_detail}"],
             errors=[f"refusing image update because the pre-update database backup failed: {exc}"],
         )
     try:
         image_snapshot = _snapshot_compose_images(args)
     except (OSError, RuntimeError, ValueError) as exc:
+        api_restarted, api_restart_detail = _start_host_api(args, paths)
         return _result(
             "update",
             "failed",
             EXIT_FAILED,
-            data={"schema_versions": versions, "changed": False, "image_pull": "not_started", "backup": pre_update_backup},
+            data={"schema_versions": versions, "changed": False, "image_pull": "not_started", "backup": pre_update_backup, "api_restart": api_restart_detail},
+            warnings=[] if api_restarted else [f"host API restart after update preflight failure was unsuccessful: {api_restart_detail}"],
             errors=[f"refusing image update because the current Compose image set could not be captured: {exc}"],
         )
     backup = pre_update_backup
@@ -1617,13 +2259,17 @@ def _command_update(args: argparse.Namespace) -> dict[str, Any]:
         rollback = _rollback_update(args, paths, backup, image_snapshot)
         outcome = "degraded" if rollback["status"] == "success" else "failed"
         return _result("update", outcome, EXIT_DEGRADED if outcome == "degraded" else EXIT_FAILED, data={"schema_versions": versions, "changed": False, "image_pull": "complete", "backup": backup, "image_snapshot": image_data, "message": start_message, "rollback": rollback}, warnings=[f"updated Compose stack failed to start; rollback status: {rollback['status']}; pre-update backup retained at {backup['target']}"])
-    ready, detail = _wait_http("http://127.0.0.1:8787/readyz", timeout=args.timeout)
+    ready, detail = _start_host_api(args, paths)
     if not ready:
         rollback = _rollback_update(args, paths, backup, image_snapshot)
         outcome = "degraded" if rollback["status"] == "success" else "failed"
         return _result("update", outcome, EXIT_DEGRADED if outcome == "degraded" else EXIT_FAILED, data={"schema_versions": versions, "changed": False, "image_pull": "complete", "backup": backup, "image_snapshot": image_data, "message": start_message, "readiness": detail, "rollback": rollback}, warnings=[f"updated Compose stack did not pass API readiness; rollback status: {rollback['status']}; pre-update backup retained at {backup['target']}"])
     service_readiness = {"api": detail}
-    for name, url in (("collector", "http://127.0.0.1:13133/"), ("grafana", "http://127.0.0.1:3000/api/health")):
+    for name, url in (
+        ("read_api", getattr(args, "read_url", "http://127.0.0.1:8788/readz")),
+        ("collector", "http://127.0.0.1:13133/"),
+        ("grafana", "http://127.0.0.1:3000/api/health"),
+    ):
         service_ready, service_detail = _wait_http(url, timeout=args.timeout)
         service_readiness[name] = service_detail
         if not service_ready:
@@ -1651,6 +2297,8 @@ def _command_status(args: argparse.Namespace) -> dict[str, Any]:
     dashboard = {"status": "ready" if dashboard_ready else "unavailable", "detail": dashboard_detail, "url": args.grafana_url}
     collector_ready, collector_detail = _probe_http(args.collector_url, timeout=args.timeout)
     collector = {"status": "ready" if collector_ready else "unavailable", "detail": collector_detail, "url": args.collector_url}
+    read_ready, read_detail = _probe_http(args.read_url, timeout=args.timeout)
+    read_api = {"status": "ready" if read_ready else "unavailable", "detail": read_detail, "url": args.read_url}
     try:
         request = Request(args.url, method="GET")
         with urlopen(request, timeout=args.timeout) as response:
@@ -1663,15 +2311,17 @@ def _command_status(args: argparse.Namespace) -> dict[str, Any]:
             warnings.append(f"Grafana is not reachable at {args.grafana_url}")
         if not collector_ready:
             warnings.append(f"OTel Collector is not reachable at {args.collector_url}")
+        if not read_ready:
+            warnings.append(f"read API is not reachable at {args.read_url}")
         if not state_initialized:
             warnings.append(f"local Observatory state is missing at {paths.root}; run install before relying on lifecycle or offline maintenance")
-        ready = dashboard_ready and collector_ready
+        ready = dashboard_ready and collector_ready and read_ready
         telemetry_ready = isinstance(health, dict) and health.get("status") == "ok"
         if not telemetry_ready:
             warnings.append("normalizer health is degraded; inference remains unmanaged/no-proxy")
-        ready = dashboard_ready and collector_ready and telemetry_ready
+        ready = dashboard_ready and collector_ready and read_ready and telemetry_ready
         overall_ready = ready and state_initialized
-        return _result("status", "success" if overall_ready else "degraded", EXIT_OK if overall_ready else EXIT_DEGRADED, data={"observatory": "ready" if ready else "degraded", "state": state, "dashboard": dashboard, "collector": collector, "telemetry": health, "live_compose": live_compose, "inference_path": "unmanaged/no-proxy"}, warnings=warnings)
+        return _result("status", "success" if overall_ready else "degraded", EXIT_OK if overall_ready else EXIT_DEGRADED, data={"observatory": "ready" if ready else "degraded", "state": state, "dashboard": dashboard, "read_api": read_api, "collector": collector, "telemetry": health, "live_compose": live_compose, "inference_path": "unmanaged/no-proxy"}, warnings=warnings)
     except (OSError, URLError, ValueError) as exc:
         warnings = [str(exc)]
         live_warning = _live_compose_warning(live_compose)
@@ -1679,7 +2329,7 @@ def _command_status(args: argparse.Namespace) -> dict[str, Any]:
             warnings.append(live_warning)
         if not state_initialized:
             warnings.append(f"local Observatory state is missing at {paths.root}; run install before relying on lifecycle or offline maintenance")
-        return _result("status", "degraded", EXIT_DEGRADED, data={"observatory": "unavailable", "state": state, "dashboard": dashboard, "collector": collector, "live_compose": live_compose, "inference_path": "unmanaged/no-proxy"}, warnings=warnings)
+        return _result("status", "degraded", EXIT_DEGRADED, data={"observatory": "unavailable", "state": state, "dashboard": dashboard, "read_api": read_api, "collector": collector, "live_compose": live_compose, "inference_path": "unmanaged/no-proxy"}, warnings=warnings)
 
 
 def _command_configure(args: argparse.Namespace) -> dict[str, Any]:
@@ -1793,6 +2443,13 @@ def _command_uninstall(args: argparse.Namespace) -> dict[str, Any]:
         config = _load_config(paths) or {}
     except RuntimeError as exc:
         return _result("uninstall", "conflict", EXIT_CONFLICT, errors=[str(exc)])
+    api_ok, api_detail = _stop_host_api(
+        paths,
+        api_url="http://127.0.0.1:8787/readyz",
+        timeout=args.timeout,
+    )
+    if not api_ok:
+        return _result("uninstall", "conflict", EXIT_CONFLICT, data={"api": api_detail}, errors=[api_detail])
 
     managed_clients = config.get("managed_clients", {})
     managed_clients = managed_clients if isinstance(managed_clients, dict) else {}
@@ -1825,7 +2482,7 @@ def _command_uninstall(args: argparse.Namespace) -> dict[str, Any]:
             "uninstall",
             "degraded",
             compose_code,
-            data={"clients": client_results, "stack": "not_removed", "inference_proxy": False},
+            data={"clients": client_results, "stack": "not_removed", "api": api_detail, "inference_proxy": False},
             errors=[compose_message],
         )
 
@@ -1859,7 +2516,7 @@ def _command_uninstall(args: argparse.Namespace) -> dict[str, Any]:
         "uninstall",
         outcome,
         exit_code,
-        data={"clients": client_results, "stack": "removed", "state": state, "inference_proxy": False},
+        data={"clients": client_results, "stack": "removed", "state": state, "api": api_detail, "inference_proxy": False},
         warnings=warnings,
     )
 
@@ -1887,10 +2544,14 @@ def build_parser() -> argparse.ArgumentParser:
     start = sub.add_parser("start")
     start.add_argument("--compose-file")
     start.add_argument("--api-url", default="http://127.0.0.1:8787/readyz")
+    start.add_argument("--api-port", type=int, default=8787)
+    start.add_argument("--read-url", default="http://127.0.0.1:8788/readz")
+    start.add_argument("--read-port", type=int, default=8788)
     start.add_argument("--collector-url", default="http://127.0.0.1:13133/")
     start.add_argument("--grafana-url", default="http://127.0.0.1:3000/api/health")
     stop = sub.add_parser("stop")
     stop.add_argument("--compose-file")
+    stop.add_argument("--api-url", default="http://127.0.0.1:8787/readyz")
     uninstall = sub.add_parser("uninstall")
     uninstall.add_argument("--compose-file")
     uninstall.add_argument("--apply", action="store_true", help="restore Observatory-owned client telemetry settings")
@@ -1898,6 +2559,7 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall.add_argument("--remove-volumes", action="store_true", help="remove Compose volumes after stopping the stack")
     status = sub.add_parser("status")
     status.add_argument("--url", default="http://127.0.0.1:8787/healthz")
+    status.add_argument("--read-url", default="http://127.0.0.1:8788/readz")
     status.add_argument("--grafana-url", default="http://127.0.0.1:3000/api/health")
     status.add_argument("--collector-url", default="http://127.0.0.1:13133/")
     configure = sub.add_parser("configure")
@@ -1945,6 +2607,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_outcome = sub.add_parser("run-outcome")
     run_outcome.add_argument("--kind", required=True)
     run_outcome.add_argument("--correlation-id")
+    # Without a basis the outcome is recorded but can never be joined to the
+    # work it followed, so the analysis surface stays empty.
+    run_outcome.add_argument("--correlation-basis")
+    run_outcome.add_argument("--task-id")
+    run_outcome.add_argument("--task-class")
+    run_outcome.add_argument("--session-id")
     run_outcome.add_argument("--evidence-source", default="local-command")
     run_outcome.add_argument("--project-path", default=str(Path.cwd()))
     run_outcome.add_argument("--command-timeout", type=float, default=900.0)
@@ -1953,6 +2621,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_outcome.add_argument("command_args", nargs=argparse.REMAINDER)
     snapshot = sub.add_parser("git-snapshot")
     snapshot.add_argument("--correlation-id")
+    snapshot.add_argument("--correlation-basis")
+    snapshot.add_argument("--task-id")
+    snapshot.add_argument("--task-class")
+    snapshot.add_argument("--session-id")
     snapshot.add_argument("--project-path", default=str(Path.cwd()))
     snapshot.add_argument("--url", default="http://127.0.0.1:8787/v1/events")
     snapshot.add_argument("--offline", action="store_true")
@@ -1961,6 +2633,10 @@ def build_parser() -> argparse.ArgumentParser:
     retention.add_argument("--prometheus-days", type=int)
     retention.add_argument("--tempo-hours", type=int)
     retention.add_argument("--loki-hours", type=int)
+    retention.add_argument("--max-database-bytes", type=int)
+    retention.add_argument("--normalized-target-ratio", type=float)
+    retention.add_argument("--normalized-max-age-days", type=int)
+    retention.add_argument("--enforce", action="store_true")
     backup = sub.add_parser("backup")
     backup.add_argument("target")
     backup.add_argument("--compose-file")
@@ -1982,15 +2658,38 @@ def build_parser() -> argparse.ArgumentParser:
     prune.add_argument("--before")
     prune.add_argument("--event-id", action="append", default=[])
     prune.add_argument("--confirm", action="store_true")
+    observe = sub.add_parser("observe")
+    observe.add_argument("--window-hours", type=int, default=DEFAULT_WINDOW_SECONDS // 3600)
+    observe.add_argument("--freshness-hours", type=int, default=DEFAULT_FRESHNESS_SECONDS // 3600)
+    # Recording turns a point-in-time verdict into a reliability record: a gap
+    # that opens and closes leaves no trace unless something wrote it down.
+    observe.add_argument("--record", action="store_true")
+    observe.add_argument("--history", action="store_true")
+    observe.add_argument("--history-hours", type=int, default=168)
+    observe.add_argument("--expected-interval-minutes", type=int, default=60)
+    collect = sub.add_parser("collect-outcomes")
+    collect.add_argument("--root")
+    collect.add_argument("--since-hours", type=int, default=24)
+    collect.add_argument("--window-minutes", type=int, default=240)
+    collect.add_argument("--apply", action="store_true")
+    # Outcomes recorded before their counterpart was reachable keep the links
+    # they had at the time; replaying adds the ones now derivable.
+    collect.add_argument("--recorrelate", action="store_true")
+    collect.add_argument("--no-ci", action="store_true")
+    bind_sessions = sub.add_parser("bind-sessions")
+    bind_sessions.add_argument("--root")
+    bind_sessions.add_argument("--apply", action="store_true")
     resolve = sub.add_parser("resolve-project")
     resolve.add_argument("path")
     api = sub.add_parser("run-api")
     api.add_argument("--host", default="127.0.0.1")
     api.add_argument("--port", type=int, default=8787)
+    api.add_argument("--read-port", type=int, default=8788)
     api.add_argument("--max-database-bytes", type=int, default=DEFAULT_MAX_DATABASE_BYTES)
     api.add_argument("--allow-remote", action="store_true", help="explicitly allow a non-loopback bind")
     api.add_argument("--allow-insecure-remote", action="store_true", help="explicitly allow a non-loopback bind without a bearer token; use only behind a trusted private network")
     api.add_argument("--auth-token-file", help="read a bearer token from an operator-owned file")
+    api.add_argument("--trust-loopback", action="store_true", help="allow loopback callers to omit the bearer token")
     return parser
 
 
@@ -2030,12 +2729,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             value = _command_restore(args)
         elif args.command == "prune":
             value = _command_prune(args)
+        elif args.command == "observe":
+            value = _command_observe(args)
+        elif args.command == "collect-outcomes":
+            value = _command_collect_outcomes(args)
+        elif args.command == "bind-sessions":
+            value = _command_bind_sessions(args)
         elif args.command == "resolve-project":
             value = _command_resolve_project(args)
         elif args.command == "start":
             value = _command_start(args)
         elif args.command == "stop":
-            value = _command_lifecycle(args, "stop", "stop")
+            value = _command_stop(args)
         elif args.command == "uninstall":
             value = _command_uninstall(args)
         elif args.command == "update":
@@ -2055,7 +2760,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif not _is_loopback_host(args.host) and auth_token is None and not args.allow_insecure_remote:
                 value = _result("run-api", "failed", EXIT_USAGE, errors=["non-loopback API binds require --auth-token-file, or an explicit --allow-insecure-remote review"])
             else:
-                serve(args.host, args.port, _paths(args).database, max_database_bytes=args.max_database_bytes, auth_token=auth_token)
+                serve(
+                    args.host,
+                    args.port,
+                    _paths(args).database,
+                    max_database_bytes=args.max_database_bytes,
+                    auth_token=auth_token,
+                    read_port=args.read_port,
+                    trust_loopback=args.trust_loopback,
+                    config_path=_paths(args).config,
+                )
                 value = _result("run-api", "success", EXIT_OK)
         else:
             value = _result(args.command, "failed", EXIT_USAGE, errors=["unsupported command"])

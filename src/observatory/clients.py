@@ -19,7 +19,7 @@ import shutil
 import site
 import subprocess
 import sys
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from .adapters.base import CapabilityRecord
@@ -619,6 +619,147 @@ def _hook_command(client: str) -> str:
     return f"{executable} hook --client {client} --quiet"
 
 
+CLAUDE_HOOK_EVENT = "SessionStart"
+# Which skill or workflow ran is the one dimension the comparison surface needs
+# and no client reports natively -- it exists only in a tool-call hook payload.
+# Measured on this host, one hook invocation costs ~307 ms (median): ~30 ms
+# interpreter start, ~128 ms imports, ~77 ms for the git subprocess in
+# `resolve_project`, and the rest in POST and argument parsing. An unscoped
+# PostToolUse hook therefore costs that on EVERY tool call -- 8,619 of them in a
+# single observed session, about 44 minutes of added wall clock.
+#
+# The matcher is what makes the capture affordable: it fires only for the tools
+# whose payloads `hooks._invoked_capability` can actually read, so the cost is
+# paid a handful of times per session rather than thousands. Keep it in step
+# with `_SKILL_TOOLS` / `_WORKFLOW_TOOLS` there.
+CLAUDE_CAPABILITY_HOOK_EVENT = "PostToolUse"
+CLAUDE_CAPABILITY_HOOK_MATCHER = "Skill|Workflow"
+# Bounded so a telemetry hook can never delay a session start for long.
+CLAUDE_HOOK_TIMEOUT_SECONDS = 5
+
+
+def _claude_hook_handler() -> dict[str, Any]:
+    return {
+        "type": "command",
+        "command": _hook_command("claude-code"),
+        "timeout": CLAUDE_HOOK_TIMEOUT_SECONDS,
+    }
+
+
+def _is_observatory_claude_hook(handler: Any) -> bool:
+    """Recognize our own hook without relying on external bookkeeping."""
+
+    return (
+        isinstance(handler, Mapping)
+        and isinstance(handler.get("command"), str)
+        and "hook --client claude-code" in handler["command"]
+    )
+
+
+def _claude_hook_groups(current: dict[str, Any], event: str = CLAUDE_HOOK_EVENT) -> list[Any]:
+    hooks = current.get("hooks")
+    if hooks is None:
+        hooks = {}
+    if not isinstance(hooks, dict):
+        raise ValueError("settings.json has a non-object hooks section")
+    groups = hooks.get(event)
+    if groups is None:
+        groups = []
+    if not isinstance(groups, list):
+        raise ValueError(f"settings.json has a non-array hooks.{event} section")
+    current["hooks"] = hooks
+    hooks[event] = groups
+    return groups
+
+
+def _apply_claude_hooks(current: dict[str, Any]) -> bool:
+    """Install a user-level SessionStart hook that reports session -> project.
+
+    Claude Code's OTel export carries a session id but no working directory, so
+    native telemetry alone cannot say which repository a session belongs to. The
+    hook runs once per session start, reports the resolved project alongside the
+    same session id, and the store binds the two. It is configured at user level,
+    so it applies to every repository without placing anything inside one.
+    """
+
+    changed = False
+    for event, matcher in (
+        (CLAUDE_HOOK_EVENT, ""),
+        (CLAUDE_CAPABILITY_HOOK_EVENT, CLAUDE_CAPABILITY_HOOK_MATCHER),
+    ):
+        groups = _claude_hook_groups(current, event)
+        desired = _claude_hook_handler()
+        found = False
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            handlers = group.get("hooks")
+            if not isinstance(handlers, list):
+                continue
+            for index, handler in enumerate(handlers):
+                if _is_observatory_claude_hook(handler):
+                    found = True
+                    if handler != desired:
+                        handlers[index] = desired
+                        changed = True
+                    # An existing group whose matcher has drifted would silently
+                    # widen or narrow what the hook fires on -- and widening is
+                    # what makes it unaffordable.
+                    if group.get("matcher") != matcher:
+                        group["matcher"] = matcher
+                        changed = True
+        if not found:
+            groups.append({"matcher": matcher, "hooks": [desired]})
+            changed = True
+    return changed
+
+
+def _remove_claude_hooks(current: dict[str, Any]) -> bool:
+    """Drop only the handlers we installed, leaving any user hooks intact."""
+
+    hooks = current.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    changed = False
+    # Both events, or `--remove` would leave the capability hook behind firing
+    # on every Skill call with nothing listening.
+    for event in (CLAUDE_HOOK_EVENT, CLAUDE_CAPABILITY_HOOK_EVENT):
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            continue
+        event_changed = False
+        surviving: list[Any] = []
+        for group in groups:
+            if not isinstance(group, dict):
+                surviving.append(group)
+                continue
+            handlers = group.get("hooks")
+            if not isinstance(handlers, list):
+                surviving.append(group)
+                continue
+            kept = [handler for handler in handlers if not _is_observatory_claude_hook(handler)]
+            if len(kept) != len(handlers):
+                event_changed = True
+            if kept:
+                group["hooks"] = kept
+                surviving.append(group)
+            elif len(group) > 2 or set(group) - {"matcher", "hooks"}:
+                group["hooks"] = kept
+                surviving.append(group)
+        if not event_changed:
+            continue
+        changed = True
+        if surviving:
+            hooks[event] = surviving
+        else:
+            hooks.pop(event, None)
+    if not changed:
+        return False
+    if not hooks:
+        current.pop("hooks", None)
+    return True
+
+
 def _toml_string(value: str) -> str:
     """Encode a command as a TOML basic string without leaking path escapes."""
 
@@ -715,6 +856,96 @@ def plan_configuration(name: str, *, enable_traces: bool = False) -> dict[str, A
     return plan
 
 
+CODEX_MARKER_START = "# BEGIN LLM Observatory managed telemetry"
+CODEX_MARKER_END = "# END LLM Observatory managed telemetry"
+
+
+def _unmanaged_observatory_hook(existing: str, client: str) -> bool:
+    """True when the config already invokes our hook outside a managed block.
+
+    Recognised by the command line rather than by any bookkeeping, so it holds
+    for hooks written by hand, by an older version, or in a different TOML shape
+    than the one we emit.
+    """
+
+    if not existing:
+        return False
+    marker = f"hook --client {client}"
+    for line in existing.splitlines():
+        if marker in line and "observatory" in line.casefold():
+            return True
+    return False
+
+
+def configuration_drift(
+    name: str,
+    *,
+    applied: bool,
+    managed_keys: Sequence[str] | None = None,
+    managed_hash: str | None = None,
+) -> list[str]:
+    """Report where the ownership record no longer matches what is on disk.
+
+    Observatory records what it wrote so `--remove` can reverse exactly that and
+    nothing else. That record is only trustworthy while it still describes the
+    file. Found live: the manifest claimed a managed block for `grok` with a
+    hash, while the config held unmarked hooks in a different format entirely --
+    so `--remove --apply` would have found nothing to reverse and reported
+    success, and `--apply` would have appended a second block, double-emitting
+    every hook event.
+
+    Nothing else detects this: `plan_configuration` is never given the manifest
+    (`cli.py:2369-2398` passes it only to apply/remove), so the plan cannot
+    compare its claim against the file.
+    """
+
+    if not applied:
+        return []
+    spec = client_spec(name)
+    path = config_path(spec)
+    if path is None:
+        return []
+    if not path.exists():
+        return [f"{spec.name}: recorded as configured, but {path} no longer exists"]
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [f"{spec.name}: recorded as configured, but {path} cannot be read ({exc})"]
+
+    keys = list(managed_keys or [])
+    problems: list[str] = []
+    if "managed_block" in keys:
+        hook_kinds = {"kimi-toml-hook", "grok-toml-hook"}
+        start = HOOK_MARKER_START if spec.config_kind in hook_kinds else CODEX_MARKER_START
+        end = HOOK_MARKER_END if spec.config_kind in hook_kinds else CODEX_MARKER_END
+        if start not in text:
+            problems.append(
+                f"{spec.name}: recorded as owning a managed block in {path}, but no Observatory "
+                "marker is present -- `--remove` cannot reverse it and `--apply` would add a "
+                "second, duplicating its telemetry"
+            )
+        elif end not in text:
+            problems.append(f"{spec.name}: the managed block in {path} is missing its END marker")
+        elif managed_hash:
+            block = text[text.index(start): text.index(end, text.index(start)) + len(end)]
+            if _managed_block_hash(block) != managed_hash:
+                problems.append(
+                    f"{spec.name}: the managed block in {path} was edited after Observatory wrote it"
+                )
+    elif keys:
+        section_name = "env" if spec.config_kind == "claude-json" else "telemetry"
+        section = _read_json_object(path).get(section_name)
+        section = section if isinstance(section, Mapping) else {}
+        missing = [key for key in keys if key not in section]
+        if missing:
+            problems.append(
+                f"{spec.name}: recorded as managing {len(keys)} {section_name} keys in {path}, "
+                f"but {len(missing)} are gone ({', '.join(sorted(missing)[:4])}"
+                f"{'...' if len(missing) > 4 else ''}) -- telemetry may be silently off"
+            )
+    return problems
+
+
 def _read_json_object(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -793,6 +1024,8 @@ def _apply_json(
     if current.get(section_name) != section:
         current[section_name] = section
         changed = True
+    if spec.config_kind == "claude-json" and _apply_claude_hooks(current):
+        changed = True
     if changed:
         _write_json_atomic(path, current)
     return {
@@ -820,12 +1053,16 @@ def _apply_codex(*, enable_traces: bool, force: bool, managed_hash: str | None =
     if marker_start in existing and marker_end not in existing:
         raise ValueError(f"incomplete Observatory block in {path}")
     block = _codex_block(enable_traces=enable_traces)
+    drifted = False
     if marker_start in existing:
         start_index = existing.index(marker_start)
         end_index = existing.index(marker_end, start_index) + len(marker_end)
         current_block = existing[start_index:end_index]
         expected_hash = managed_hash or _managed_block_hash(block)
-        if _managed_block_hash(current_block) != expected_hash:
+        drifted = _managed_block_hash(current_block) != expected_hash
+        # `--force` is the documented way to replace a conflicting managed
+        # value, and every JSON client honors it.
+        if drifted and not force:
             return {
                 "changed": False,
                 "conflicts": ["managed Observatory block changed by user"],
@@ -863,12 +1100,13 @@ def _apply_codex(*, enable_traces: bool, force: bool, managed_hash: str | None =
         "managed_block": True,
         "managed_keys": ["managed_block"],
         "managed_hash": _managed_block_hash(block),
+        "overwritten": ["managed_block"] if drifted else [],
         "inference_proxy": False,
         "content_capture": False,
     }
 
 
-def _apply_hook(spec: ClientSpec, *, managed_hash: str | None = None) -> dict[str, Any]:
+def _apply_hook(spec: ClientSpec, *, force: bool = False, managed_hash: str | None = None) -> dict[str, Any]:
     path = config_path(spec)
     if path is None:
         raise ValueError(f"client {spec.name} does not have a hook configuration path")
@@ -876,12 +1114,16 @@ def _apply_hook(spec: ClientSpec, *, managed_hash: str | None = None) -> dict[st
     if HOOK_MARKER_START in existing and HOOK_MARKER_END not in existing:
         raise ValueError(f"incomplete Observatory hook block in {path}")
     block = _hook_block(spec)
+    drifted = False
     if HOOK_MARKER_START in existing:
         start_index = existing.index(HOOK_MARKER_START)
         end_index = existing.index(HOOK_MARKER_END, start_index) + len(HOOK_MARKER_END)
         current_block = existing[start_index:end_index]
         expected_hash = managed_hash or _managed_block_hash(block)
-        if _managed_block_hash(current_block) != expected_hash:
+        drifted = _managed_block_hash(current_block) != expected_hash
+        # `--force` is the documented way to replace a conflicting managed
+        # value, and every JSON client honors it.
+        if drifted and not force:
             return {
                 "changed": False,
                 "conflicts": ["managed Observatory hook block changed by user"],
@@ -894,6 +1136,22 @@ def _apply_hook(spec: ClientSpec, *, managed_hash: str | None = None) -> dict[st
         after = existing[end_index:]
         new_text = before + block.rstrip("\n") + after
         changed = new_text != existing
+    elif _unmanaged_observatory_hook(existing, spec.name) and not force:
+        # Observatory hooks are already here without our markers -- installed by
+        # hand, or by a version that did not mark them. Appending a marked block
+        # would leave the client invoking the hook twice per event, doubling
+        # this client's telemetry against every other client it is compared
+        # with. Found live on grok, whose config carries three unmarked
+        # `observatory.exe hook --client grok` entries in a different TOML shape
+        # from the one we write.
+        return {
+            "changed": False,
+            "conflicts": ["unmarked Observatory hooks already present; applying would duplicate them"],
+            "path": str(path),
+            "inference_proxy": False,
+            "managed_block": True,
+            "managed_keys": ["managed_block"],
+        }
     else:
         separator = "\n" if existing and not existing.endswith("\n") else ""
         new_text = existing + separator + block
@@ -907,6 +1165,7 @@ def _apply_hook(spec: ClientSpec, *, managed_hash: str | None = None) -> dict[st
         "managed_block": True,
         "managed_keys": ["managed_block"],
         "managed_hash": _managed_block_hash(block),
+        "overwritten": ["managed_block"] if drifted else [],
         "inference_proxy": False,
         "content_capture": False,
     }
@@ -929,7 +1188,7 @@ def apply_configuration(
     result = (
         _apply_codex(enable_traces=enable_traces, force=force, managed_hash=managed_hash)
         if spec.config_kind == "codex-toml"
-        else _apply_hook(spec, managed_hash=managed_hash)
+        else _apply_hook(spec, force=force, managed_hash=managed_hash)
         if spec.config_kind in {"kimi-toml-hook", "grok-toml-hook"}
         else _apply_json(spec, enable_traces=enable_traces, force=force, managed_state=managed_state)
     )
@@ -1007,16 +1266,18 @@ def _remove_json(
             if section.get(key) != original:
                 section[key] = original
                 restored.append(key)
-    if removed or restored:
+    hooks_removed = _remove_claude_hooks(current) if spec.config_kind == "claude-json" else False
+    if removed or restored or hooks_removed:
         if section:
             current[section_name] = section
         else:
             current.pop(section_name, None)
         _write_json_atomic(path, current)
     return {
-        "changed": bool(removed or restored),
+        "changed": bool(removed or restored or hooks_removed),
         "removed": sorted(removed),
         "restored": sorted(restored),
+        "hooks_removed": hooks_removed,
         "path": str(path),
         "inference_proxy": False,
     }

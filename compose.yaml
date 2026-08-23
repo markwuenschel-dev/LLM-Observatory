@@ -1,25 +1,6 @@
 name: llm-observatory
 
 services:
-  observatory-api:
-    build:
-      context: .
-    image: ${OBSERVATORY_API_IMAGE:-llm-observatory-api:0.1.0}
-    command: ["python", "-m", "observatory.cli", "--state-dir", "/var/lib/observatory", "run-api", "--host", "0.0.0.0", "--allow-remote", "--allow-insecure-remote", "--port", "8787", "--max-database-bytes", "${OBSERVATORY_MAX_DATABASE_BYTES:-2147483648}"]
-    restart: unless-stopped
-    stop_grace_period: 30s
-    mem_limit: 512m
-    cpus: 1.0
-    volumes:
-      - ${OBSERVATORY_STATE_DIR:?Run observatory install before starting Compose}:/var/lib/observatory
-    ports:
-      - "127.0.0.1:8787:8787"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/readyz', timeout=2)"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-
   otel-collector:
     image: ${OTEL_COLLECTOR_IMAGE:-otel/opentelemetry-collector-contrib@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5}
     command: ["--config=/etc/otelcol/config.yaml"]
@@ -28,11 +9,15 @@ services:
     depends_on:
       otel-queue-init:
         condition: service_completed_successfully
+      api-bridge-check:
+        condition: service_completed_successfully
     mem_limit: 512m
     cpus: 1.0
     volumes:
       - ./deployment/otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
       - otel-queue:/var/lib/otelcol
+    secrets:
+      - observatory_api_token
     ports:
       - "127.0.0.1:4317:4317"
       - "127.0.0.1:4318:4318"
@@ -106,6 +91,11 @@ services:
     volumes:
       - ./deployment/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
+    secrets:
+      - observatory_api_token
+    depends_on:
+      api-bridge-check:
+        condition: service_completed_successfully
     expose:
       - "9090"
     healthcheck:
@@ -128,6 +118,10 @@ services:
       GF_SERVER_ROOT_URL: http://127.0.0.1:3000
     secrets:
       - grafana_admin_password
+      - observatory_api_authorization
+    depends_on:
+      api-bridge-check:
+        condition: service_completed_successfully
     volumes:
       - ./deployment/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./dashboards:/var/lib/grafana/dashboards:ro
@@ -140,6 +134,19 @@ services:
       timeout: 3s
       retries: 5
 
+  api-bridge-check:
+    image: ${ALPINE_IMAGE:-alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1}
+    command:
+      - sh
+      - -ec
+      - |
+        token=$$(cat /run/secrets/observatory_api_token)
+        wget -q -O - --header "Authorization: Bearer $$token" http://host.docker.internal:8787/readyz >/dev/null
+        wget -q -O - --header "Authorization: Bearer $$token" http://host.docker.internal:8788/readz >/dev/null
+    restart: "no"
+    secrets:
+      - observatory_api_token
+
 volumes:
   otel-queue:
   tempo-data:
@@ -150,3 +157,7 @@ volumes:
 secrets:
   grafana_admin_password:
     file: ${OBSERVATORY_SECRET_FILE:?Run observatory install before starting Compose}
+  observatory_api_token:
+    file: ${OBSERVATORY_API_TOKEN_FILE:?Run observatory install before starting Compose}
+  observatory_api_authorization:
+    file: ${OBSERVATORY_API_AUTHORIZATION_FILE:?Run observatory install before starting Compose}

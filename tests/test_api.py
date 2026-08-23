@@ -3,12 +3,21 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from observatory.api import ObservatoryApplication, ObservatoryHTTPServer, _parse_query
+from observatory.api import (
+    DEFAULT_READ_TIMEOUT,
+    OBSERVATION_READ_TIMEOUT,
+    DashboardReadPool,
+    ObservatoryApplication,
+    ObservatoryHTTPServer,
+    _parse_query,
+)
 from observatory.store import EventStore
 
 from tests.test_contracts import event_mapping
@@ -182,6 +191,71 @@ class ApiTests(unittest.TestCase):
         status, result = self.request("GET", "/v1/summary")
         self.assertEqual(status, 503)
         self.assertEqual(result["error"], "store_unavailable")
+
+    def test_dashboard_read_lane_cannot_starve_health_or_intake(self) -> None:
+        self.server.shutdown()
+        self.thread.join(timeout=3)
+        self.server.server_close()
+        self.store.close()
+
+        self.store = EventStore(Path(self.temp.name) / "isolated.sqlite3")
+        application = ObservatoryApplication(self.store, max_request_bytes=4096, max_read_requests=1)
+        self.server = ObservatoryHTTPServer(("127.0.0.1", 0), application)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+        self.assertTrue(application.read_pool._slots.acquire(blocking=False))
+        try:
+            status, unavailable = self.request("GET", "/api/v1/query?query=1")
+            self.assertEqual(status, 503)
+            self.assertEqual(unavailable["error"], "dashboard_query_unavailable")
+            self.assertEqual(unavailable["reason"], "read_lane_saturated")
+
+            status, health = self.request("GET", "/readyz")
+            self.assertEqual(status, 200)
+            self.assertEqual(health["status"], "ok")
+
+            status, intake = self.request("POST", "/v1/events", event_mapping())
+            self.assertEqual(status, 200)
+            self.assertEqual(intake["inserted"], 1)
+        finally:
+            application.read_pool._slots.release()
+
+    def test_control_and_read_planes_expose_only_their_routes(self) -> None:
+        application = ObservatoryApplication(self.store, max_request_bytes=4096)
+        control = ObservatoryHTTPServer(("127.0.0.1", 0), application, plane="control")
+        read = ObservatoryHTTPServer(("127.0.0.1", 0), application, plane="read")
+        control_thread = threading.Thread(target=control.serve_forever, daemon=True)
+        read_thread = threading.Thread(target=read.serve_forever, daemon=True)
+        control_thread.start()
+        read_thread.start()
+
+        def get(port: int, path: str, *, method: str = "GET", value: object | None = None) -> int:
+            data = None if value is None else json.dumps(value).encode("utf-8")
+            request = Request(f"http://127.0.0.1:{port}{path}", data=data, method=method)
+            try:
+                with urlopen(request, timeout=3) as response:
+                    response.read()
+                    return response.status
+            except HTTPError as exc:
+                try:
+                    exc.read()
+                    return exc.code
+                finally:
+                    exc.close()
+
+        try:
+            self.assertEqual(get(control.server_port, "/readyz"), 200)
+            self.assertEqual(get(control.server_port, "/v1/summary"), 404)
+            self.assertEqual(get(read.server_port, "/readz"), 200)
+            self.assertEqual(get(read.server_port, "/v1/summary"), 200)
+            self.assertEqual(get(read.server_port, "/v1/events", method="POST", value=event_mapping()), 404)
+        finally:
+            for server, thread in ((control, control_thread), (read, read_thread)):
+                server.shutdown()
+                thread.join(timeout=3)
+                server.server_close()
 
     def test_ingest_reports_store_unavailable_without_resetting_the_connection(self) -> None:
         self.store.close()
@@ -410,6 +484,189 @@ class ApiTests(unittest.TestCase):
             status, result = self.request("GET", f"{path}?unexpected=value")
             self.assertEqual(status, 400)
             self.assertIn("unsupported query parameter", result["error"])
+
+
+class _BudgetRecordingPool(DashboardReadPool):
+    """A read pool that records every execution budget it hands out.
+
+    The unit that matters for lane occupancy is the budget granted per pool
+    admission, so recording it is what separates "one request, one deadline"
+    from "one request, one deadline per query".
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.granted: list[float] = []
+        # `run` may be implemented on top of `lease`, so count the outermost
+        # entry point only: one record per pool admission, not per call layer.
+        self._depth = threading.local()
+
+    def _record(self, timeout: float | None) -> None:
+        self.granted.append(timeout if timeout and timeout > 0 else self.timeout)
+
+    def run(self, operation, *, timeout=None, **kwargs):
+        self._record(timeout)
+        depth = getattr(self._depth, "value", 0)
+        self._depth.value = depth + 1
+        try:
+            return super().run(operation, timeout=timeout, **kwargs)
+        finally:
+            self._depth.value = depth
+
+    def lease(self, *, timeout=None, **kwargs):
+        if getattr(self._depth, "value", 0) == 0:
+            self._record(timeout)
+        return super().lease(timeout=timeout, **kwargs)
+
+
+class ReadLaneBudgetTests(unittest.TestCase):
+    """A read bound is only honest if it bounds the whole request.
+
+    `/v1/observation` is served on the same read plane, and out of the same
+    pool, as every Grafana panel. It issues three store reads, so a per-query
+    deadline let one request hold a read slot for three deadlines, and nothing
+    capped how many such requests could hold slots at once. Starvation is
+    duration x concurrency; both have to be bounded, and these tests pin both.
+    """
+
+    def _serve(self, **application_kwargs):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        store = EventStore(Path(temp.name) / "events.sqlite3")
+        self.addCleanup(store.close)
+        application = ObservatoryApplication(store, max_request_bytes=4096, **application_kwargs)
+        server = ObservatoryHTTPServer(("127.0.0.1", 0), application)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.shutdown)
+        return application, f"http://127.0.0.1:{server.server_port}"
+
+    @staticmethod
+    def _get(base: str, path: str, *, timeout: float = 30) -> tuple[int, dict]:
+        try:
+            with urlopen(Request(base + path), timeout=timeout) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            try:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+            finally:
+                exc.close()
+
+    def test_observation_is_granted_one_read_budget_not_one_per_query(self) -> None:
+        application, base = self._serve()
+        pool = _BudgetRecordingPool(application.store.path, max_bytes=application.store.max_bytes)
+        application.read_pool = pool
+
+        status, _report = self._get(base, "/v1/observation")
+
+        self.assertIn(status, (200, 503))
+        self.assertTrue(pool.granted, "the observation route did not use the dashboard read pool")
+        self.assertLessEqual(
+            sum(pool.granted),
+            OBSERVATION_READ_TIMEOUT,
+            f"one /v1/observation request was granted {pool.granted} read budgets "
+            f"({sum(pool.granted)}s in total), so it may hold a read slot far "
+            f"longer than the single stated {OBSERVATION_READ_TIMEOUT}s deadline",
+        )
+
+    def test_ordinary_dashboard_reads_keep_the_short_deadline(self) -> None:
+        application, base = self._serve()
+        pool = _BudgetRecordingPool(application.store.path, max_bytes=application.store.max_bytes)
+        application.read_pool = pool
+
+        status, _summary = self._get(base, "/v1/summary")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(pool.granted, [DEFAULT_READ_TIMEOUT])
+
+    def test_the_shared_budget_stops_the_remaining_reads_once_it_is_spent(self) -> None:
+        _application, base = self._serve()
+        sample_calls: list[float] = []
+        lifetime_calls: list[float] = []
+        original_samples = EventStore.observation_samples
+        original_lifetime = EventStore.client_lifetime
+
+        def slow_samples(store, *args, **kwargs):
+            sample_calls.append(time.monotonic())
+            time.sleep(0.3)
+            return original_samples(store, *args, **kwargs)
+
+        def counted_lifetime(store, *args, **kwargs):
+            lifetime_calls.append(time.monotonic())
+            return original_lifetime(store, *args, **kwargs)
+
+        with patch.object(EventStore, "observation_samples", slow_samples), patch.object(
+            EventStore, "client_lifetime", counted_lifetime
+        ), patch("observatory.api.OBSERVATION_READ_TIMEOUT", 0.4):
+            status, _report = self._get(base, "/v1/observation")
+
+        self.assertIn(status, (200, 503))
+        self.assertEqual(
+            lifetime_calls,
+            [],
+            "the third observation read started even though the 0.4s budget was "
+            f"already spent by {len(sample_calls)} earlier reads: the handler is "
+            "getting a fresh deadline per query instead of one for the request",
+        )
+
+    def test_saturating_slow_observation_requests_cannot_starve_ordinary_reads(self) -> None:
+        application, base = self._serve(max_read_requests=4)
+        release = threading.Event()
+        self.addCleanup(release.set)
+        lock = threading.Lock()
+        state = {"blocked": 0, "returned": 0}
+        original_samples = EventStore.observation_samples
+
+        def blocking_samples(store, *args, **kwargs):
+            with lock:
+                state["blocked"] += 1
+            release.wait(30)
+            return original_samples(store, *args, **kwargs)
+
+        patcher = patch.object(EventStore, "observation_samples", blocking_samples)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        def observe() -> None:
+            try:
+                self._get(base, "/v1/observation", timeout=60)
+            finally:
+                with lock:
+                    state["returned"] += 1
+
+        threads = [threading.Thread(target=observe, daemon=True) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+
+        settled = time.monotonic() + 20
+        while time.monotonic() < settled:
+            with lock:
+                if state["blocked"] + state["returned"] >= len(threads):
+                    break
+            time.sleep(0.02)
+        else:  # pragma: no cover - only reached on a wedged run
+            self.fail("the observation requests never reached the read lane")
+
+        try:
+            status, body = self._get(base, "/v1/summary", timeout=10)
+            self.assertEqual(
+                status,
+                200,
+                "an ordinary dashboard read was starved by concurrent slow "
+                f"/v1/observation requests: {body}",
+            )
+            self.assertLess(
+                application.read_pool.max_extended_requests,
+                application.read_pool.max_requests,
+                "long-budget reads must be capped strictly below the pool so that "
+                "ordinary panel reads always keep capacity",
+            )
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(timeout=30)
 
 
 if __name__ == "__main__":

@@ -2,26 +2,200 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from http import HTTPStatus
+import ipaddress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import secrets
 import socket
 from pathlib import Path
 import sqlite3
-from threading import BoundedSemaphore, Lock
+from threading import BoundedSemaphore, Lock, Thread
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, urlsplit
 
 from .intake import Intake
 from .otel_bridge import OTLPJsonBridge
 from .prometheus import PrometheusQueryEngine, PrometheusQueryError
+from .observation import (
+    DEFAULT_FRESHNESS_SECONDS,
+    DEFAULT_WINDOW_SECONDS,
+    observation_report,
+    window_start,
+)
 from .store import DEFAULT_MAX_DATABASE_BYTES, EventStore
 
 
 MAX_QUERY_BYTES = 64 * 1024
 MAX_QUERY_FIELDS = 128
+DEFAULT_READ_REQUESTS = 12
+DEFAULT_READ_TIMEOUT = 2.0
+# The health verdict aggregates the whole store and is an operator request,
+# not a dashboard panel; a panel-sized bound made a healthy deployment 503.
+# This is the budget for the WHOLE verdict, shared by every query it issues --
+# not a per-query bound that a multi-query handler can spend once per read.
+OBSERVATION_READ_TIMEOUT = 15.0
+
+
+def extended_request_cap(max_requests: int) -> int:
+    """How many long-budget reads may hold pool slots at the same time.
+
+    A quarter of the lane, and never the whole of it: the remainder is what
+    ordinary panel reads are guaranteed while slow operator requests are in
+    flight. A single-slot pool has nothing to reserve, so it degrades to one.
+    """
+
+    return min(max(1, max_requests // 4), max(1, max_requests - 1))
+
+
+class DashboardReadUnavailable(RuntimeError):
+    """A dashboard read cannot be admitted or completed within its budget."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class _LeasedRead:
+    """Run reads against one leased connection under one shared deadline.
+
+    Every read the lease serves is charged against the same absolute deadline,
+    so a handler that issues several queries spends one budget rather than a
+    fresh budget per query. Once the budget is gone no further read starts.
+    """
+
+    __slots__ = ("_store", "_deadline")
+
+    def __init__(self, store: EventStore, deadline: float) -> None:
+        self._store = store
+        self._deadline = deadline
+
+    @property
+    def remaining(self) -> float:
+        return max(self._deadline - time.monotonic(), 0.0)
+
+    def _expired(self) -> DashboardReadUnavailable:
+        return DashboardReadUnavailable(
+            "read_deadline_exceeded", "dashboard query exceeded its execution budget"
+        )
+
+    def __call__(self, operation: Callable[[EventStore], Any]) -> Any:
+        if time.monotonic() >= self._deadline:
+            raise self._expired()
+        try:
+            value = operation(self._store)
+        except sqlite3.OperationalError as exc:
+            if time.monotonic() >= self._deadline or "interrupted" in str(exc).casefold():
+                raise self._expired() from exc
+            raise
+        if time.monotonic() >= self._deadline:
+            raise self._expired()
+        return value
+
+
+class DashboardReadPool:
+    """Run bounded dashboard reads on independent read-only SQLite connections."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        max_requests: int = DEFAULT_READ_REQUESTS,
+        timeout: float = DEFAULT_READ_TIMEOUT,
+        max_bytes: int | None = DEFAULT_MAX_DATABASE_BYTES,
+        max_extended_requests: int | None = None,
+    ) -> None:
+        if max_requests < 1:
+            raise ValueError("max_requests must be positive")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if max_extended_requests is None:
+            max_extended_requests = extended_request_cap(max_requests)
+        if not 1 <= max_extended_requests <= max_requests:
+            raise ValueError("max_extended_requests must be between 1 and max_requests")
+        self.path = Path(path)
+        self.timeout = timeout
+        self.max_bytes = max_bytes
+        self.max_requests = max_requests
+        self.max_extended_requests = max_extended_requests
+        # What ordinary panel reads keep no matter how many slow operator
+        # requests arrive at once. Zero only for a degenerate one-slot pool.
+        self.reserved_ordinary_requests = max_requests - max_extended_requests
+        self._slots = BoundedSemaphore(max_requests)
+        self._extended_slots = BoundedSemaphore(max_extended_requests)
+
+    @contextmanager
+    def lease(self, *, timeout: float | None = None, extended: bool = False):
+        """Hold one slot and one connection for a sequence of reads on ONE budget.
+
+        Two independent bounds are what make a read safe here, and a slot count
+        is only the first of them:
+
+        * one slot, so no request occupies more of the lane than any other;
+        * one deadline for the entire lease, so a handler that issues several
+          queries cannot spend a fresh deadline per query. This is the bound
+          that makes a stated timeout the real time a slot can be held.
+
+        Holding one slot is NOT on its own a reason a longer deadline is safe:
+        lane starvation is duration x concurrency, so a longer duration only
+        stays safe while the number of concurrent long holders is capped.
+        ``extended`` leases -- the operator health verdict, which aggregates the
+        whole store and legitimately needs longer than a panel -- are therefore
+        admitted through a second, smaller gate of ``max_extended_requests``,
+        strictly below ``max_requests`` for any pool with more than one slot.
+        That leaves ``reserved_ordinary_requests`` slots for ordinary panel
+        reads however many slow verdicts arrive together, and the excess slow
+        requests are refused at the gate without ever taking a lane slot.
+        """
+
+        budget = timeout if timeout and timeout > 0 else self.timeout
+        if extended and not self._extended_slots.acquire(blocking=False):
+            raise DashboardReadUnavailable(
+                "extended_read_lane_saturated", "extended dashboard read lane is full"
+            )
+        try:
+            if not self._slots.acquire(blocking=False):
+                raise DashboardReadUnavailable("read_lane_saturated", "dashboard read lane is full")
+            try:
+                deadline = time.monotonic() + budget
+                store = EventStore(self.path, max_bytes=self.max_bytes, read_only=True)
+                try:
+                    store.connection.set_progress_handler(
+                        lambda: 1 if time.monotonic() >= deadline else 0,
+                        1_000,
+                    )
+                    yield _LeasedRead(store, deadline)
+                finally:
+                    try:
+                        store.connection.set_progress_handler(None, 0)
+                    finally:
+                        store.close()
+            finally:
+                self._slots.release()
+        finally:
+            if extended:
+                self._extended_slots.release()
+
+    def run(
+        self,
+        operation: Callable[[EventStore], Any],
+        *,
+        timeout: float | None = None,
+        extended: bool = False,
+    ) -> Any:
+        """Run a single read on its own slot under its own budget."""
+
+        with self.lease(timeout=timeout, extended=extended) as read:
+            return read(operation)
+
+def _is_loopback_address(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
 
 
 def _ingest_status(result: Any) -> HTTPStatus:
@@ -41,15 +215,34 @@ def _ingest_outcome(result: Any) -> str:
 
 
 class ObservatoryApplication:
-    def __init__(self, store: EventStore, *, max_request_bytes: int = 8_388_608, max_records: int = 256) -> None:
+    def __init__(
+        self,
+        store: EventStore,
+        *,
+        max_request_bytes: int = 8_388_608,
+        max_records: int = 256,
+        max_read_requests: int = DEFAULT_READ_REQUESTS,
+        max_extended_read_requests: int | None = None,
+        read_timeout: float = DEFAULT_READ_TIMEOUT,
+        config_path: str | Path | None = None,
+    ) -> None:
         if max_request_bytes < 1024:
             raise ValueError("max_request_bytes must be at least 1024")
         self.store = store
+        self.config_path = Path(config_path) if config_path else None
         self.intake = Intake(store, max_records=max_records)
         self.otel = OTLPJsonBridge(store, max_records=max_records)
         self.prometheus = PrometheusQueryEngine(store)
+        self.read_pool = DashboardReadPool(
+            store.path,
+            max_requests=max_read_requests,
+            max_extended_requests=max_extended_read_requests,
+            timeout=read_timeout,
+            max_bytes=store.max_bytes,
+        )
         self.max_request_bytes = max_request_bytes
-        self.lock = Lock()
+        self.intake_lock = Lock()
+        self.stats_lock = Lock()
         self.started_at = store.connection.execute("SELECT datetime('now')").fetchone()[0]
         self.started_monotonic = time.monotonic()
         self.ingest_batches = 0
@@ -59,8 +252,9 @@ class ObservatoryApplication:
 
     def ingest_json(self, value: Any) -> tuple[int, dict[str, Any]]:
         records = value if isinstance(value, list) else [value]
-        with self.lock:
+        with self.intake_lock:
             result = self.intake.ingest(records)
+        with self.stats_lock:
             self.ingest_batches += 1
             self.ingest_records += result.inserted + result.duplicate + result.conflict + result.rejected
             self.ingest_rejected += result.rejected
@@ -70,8 +264,9 @@ class ObservatoryApplication:
     def ingest_otlp(self, signal: str, value: Any) -> tuple[int, dict[str, Any]]:
         if not isinstance(value, Mapping):
             return HTTPStatus.BAD_REQUEST, {"error": "OTLP payload must be an object"}
-        with self.lock:
+        with self.intake_lock:
             result = self.otel.ingest(signal, value)
+        with self.stats_lock:
             self.ingest_batches += 1
             self.ingest_records += result.inserted + result.duplicate + result.conflict + result.rejected
             self.ingest_rejected += result.rejected
@@ -79,83 +274,244 @@ class ObservatoryApplication:
         return _ingest_status(result), {"schema": "observatory.otlp/v1", "signal": signal, "outcome": _ingest_outcome(result), **result.to_mapping()}
 
     def summary(self, filters: Mapping[str, str]) -> dict[str, Any]:
-        with self.lock:
-            return {"schema": "observatory.summary/v1", "filters": dict(filters), "data": self.store.summary(filters)}
+        return self._read(lambda store: {"schema": "observatory.summary/v1", "filters": dict(filters), "data": store.summary(filters)})
 
     def events(self, filters: Mapping[str, str], limit: int) -> dict[str, Any]:
-        with self.lock:
-            values = [event.to_mapping() for event in self.store.list_events(filters, limit=limit)]
-        return {"schema": "observatory.events/v1", "count": len(values), "events": values}
+        return self._read(
+            lambda store: {
+                "schema": "observatory.events/v1",
+                "count": len(values := [event.to_mapping() for event in store.list_events(filters, limit=limit)]),
+                "events": values,
+            }
+        )
 
     def event_detail(self, event_id: str) -> tuple[int, dict[str, Any]]:
-        with self.lock:
-            value = self.store.event_detail(event_id)
+        value = self._read(lambda store: store.event_detail(event_id))
         if value is None:
             return HTTPStatus.NOT_FOUND, {"error": "event_not_found", "event_id": event_id}
         return HTTPStatus.OK, {"schema": "observatory.event-detail/v1", **value}
 
     def measurements(self, event_id: str | None, limit: int) -> dict[str, Any]:
-        with self.lock:
-            values = self.store.measurement_facts(event_id=event_id, limit=limit)
-        return {"schema": "observatory.measurements/v1", "count": len(values), "measurements": values}
+        return self._read(
+            lambda store: {
+                "schema": "observatory.measurements/v1",
+                "count": len(values := store.measurement_facts(event_id=event_id, limit=limit)),
+                "measurements": values,
+            }
+        )
 
     def outcomes(self, event_id: str | None, limit: int) -> dict[str, Any]:
-        with self.lock:
-            values = self.store.outcomes(event_id=event_id, limit=limit)
-        return {"schema": "observatory.outcomes/v1", "count": len(values), "outcomes": values}
+        return self._read(
+            lambda store: {
+                "schema": "observatory.outcomes/v1",
+                "count": len(values := store.outcomes(event_id=event_id, limit=limit)),
+                "outcomes": values,
+            }
+        )
 
     def attribution(self, event_id: str | None, limit: int) -> dict[str, Any]:
-        with self.lock:
-            values = self.store.attribution_edges(event_id=event_id, limit=limit)
-        return {"schema": "observatory.attribution/v1", "count": len(values), "edges": values}
+        return self._read(
+            lambda store: {
+                "schema": "observatory.attribution/v1",
+                "count": len(values := store.attribution_edges(event_id=event_id, limit=limit)),
+                "edges": values,
+            }
+        )
 
     def comparison(self, filters: Mapping[str, str], limit: int) -> dict[str, Any]:
-        with self.lock:
-            values = self.store.comparison(filters, limit=limit)
-        return {"schema": "observatory.analytics-comparison/v1", "count": len(values), "comparisons": values}
+        return self._read(
+            lambda store: {
+                "schema": "observatory.analytics-comparison/v1",
+                "count": len(values := store.comparison(filters, limit=limit)),
+                "comparisons": values,
+            }
+        )
+
+    def _read(
+        self,
+        operation: Callable[[EventStore], Any],
+        *,
+        timeout: float | None = None,
+        extended: bool = False,
+    ) -> Any:
+        if self.store.closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database")
+        return self.read_pool.run(operation, timeout=timeout, extended=extended)
+
+    def _read_session(self, *, timeout: float | None = None, extended: bool = False):
+        """One read lease for a handler that needs several reads to agree on a budget."""
+
+        if self.store.closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database")
+        return self.read_pool.lease(timeout=timeout, extended=extended)
+
+    def _stats_snapshot(self) -> dict[str, Any]:
+        with self.stats_lock:
+            return {
+                "batches": self.ingest_batches,
+                "records": self.ingest_records,
+                "rejected": self.ingest_rejected,
+                "unavailable": self.ingest_unavailable,
+                # Spans that arrived carrying nothing analysis can use. Reported
+                # so a client that emits only empty spans is distinguishable
+                # from one that emits nothing at all -- comparing those two as
+                # the same thing is exactly what the coverage rules forbid.
+                "dropped_empty_spans": self.otel.dropped_empty_spans,
+                "dropped_empty_by_source": dict(self.otel.dropped_empty_by_source),
+            }
+
+    def _probe_store(self) -> None:
+        if self.store.closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database")
+        connection = sqlite3.connect(
+            f"{self.store.path.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=0.25,
+        )
+        try:
+            connection.execute("SELECT 1").fetchone()
+        finally:
+            connection.close()
 
     def health(self) -> dict[str, Any]:
-        with self.lock:
-            ingest = {"batches": self.ingest_batches, "records": self.ingest_records, "rejected": self.ingest_rejected, "unavailable": self.ingest_unavailable}
-            try:
-                self.store.connection.execute("SELECT 1").fetchone()
-            except sqlite3.Error:
-                return {
-                    "schema": "observatory.health/v1",
-                    "status": "degraded",
-                    "store": "unavailable",
-                    "started_at": self.started_at,
-                    "uptime_seconds": round(max(time.monotonic() - self.started_monotonic, 0.0), 3),
-                    "ingest": ingest,
-                    "store_capacity": self.store.capacity(),
-                    "inference_path": "unmanaged/no-proxy",
-                }
-            capacity = self.store.capacity()
-            status = "degraded" if capacity["exhausted"] else "ok"
+        ingest = self._stats_snapshot()
+        capacity = self.store.capacity()
+        try:
+            self._probe_store()
+        except (OSError, sqlite3.Error):
+            return {
+                "schema": "observatory.health/v1",
+                "status": "degraded",
+                "store": "unavailable",
+                "started_at": self.started_at,
+                "process_id": os.getpid(),
+                "uptime_seconds": round(max(time.monotonic() - self.started_monotonic, 0.0), 3),
+                "ingest": ingest,
+                "store_capacity": capacity,
+                "inference_path": "unmanaged/no-proxy",
+            }
+        status = "degraded" if capacity["exhausted"] else "ok"
         return {
             "schema": "observatory.health/v1",
             "status": status,
             "store": "ready",
             "started_at": self.started_at,
+            "process_id": os.getpid(),
             "uptime_seconds": round(max(time.monotonic() - self.started_monotonic, 0.0), 3),
             "ingest": ingest,
             "store_capacity": capacity,
             "inference_path": "unmanaged/no-proxy",
         }
 
+    def outcome_value(self, filters: Mapping[str, str], limit: int) -> dict[str, Any]:
+        """Spend and effort associated with observed engineering outcomes."""
+
+        return self._read(
+            lambda store: {
+                "schema": "observatory.outcome-value/v1",
+                "filters": dict(filters),
+                "association_only": True,
+                "note": "rows report association through the stated correlation basis, not causation",
+                "data": store.outcome_value(filters, limit=limit),
+            }
+        )
+
+    def engineering_value(self, filters: Mapping[str, str], limit: int) -> dict[str, Any]:
+        """Ranked configurations by validated outcome relative to effort."""
+
+        return self._read(lambda store: store.engineering_value(filters, limit=limit))
+
+    def observation_reliability(self, *, window_seconds: int = DEFAULT_WINDOW_SECONDS) -> dict[str, Any]:
+        """Recorded verdict history plus the gaps in it.
+
+        A gap in the record is itself a finding: an interval with no snapshot
+        means nothing was checking, which is a different failure from a
+        recorded degradation and must not be read as "no problems".
+        """
+
+        return self._read(
+            lambda store: {
+                "schema": "observatory.observation-history/v1",
+                "history": store.observation_history(since=window_start(window_seconds), limit=500),
+                "reliability": store.observation_gaps(since=window_start(window_seconds)),
+                "coverage_drift": store.coverage_drift(since=window_start(window_seconds)),
+            }
+        )
+
+    def observation(
+        self,
+        *,
+        window_seconds: int = DEFAULT_WINDOW_SECONDS,
+        freshness_seconds: int = DEFAULT_FRESHNESS_SECONDS,
+    ) -> dict[str, Any]:
+        """Whether this deployment is actually observing, with evidence.
+
+        Derived from what the store has received rather than from service
+        health, because every service can report healthy while nothing at all is
+        being persisted.
+        """
+
+        managed: dict[str, Any] = {}
+        if self.config_path is not None:
+            try:
+                config = json.loads(self.config_path.read_text(encoding="utf-8"))
+                if isinstance(config, Mapping):
+                    owned = config.get("managed_clients")
+                    if isinstance(owned, Mapping):
+                        managed = dict(owned)
+            except (OSError, json.JSONDecodeError):
+                # Ownership is context, not a precondition; a missing manifest
+                # must not stop the verdict from being reported.
+                managed = {}
+        try:
+            # One lease, so all three queries share a single deadline and a
+            # single slot: the verdict costs the lane one OBSERVATION_READ_TIMEOUT,
+            # not one per query. The lease is extended, so concurrent verdicts
+            # are capped well below the pool and cannot crowd out panel reads.
+            with self._read_session(timeout=OBSERVATION_READ_TIMEOUT, extended=True) as read:
+                samples = read(lambda store: store.observation_samples(window_start(window_seconds)))
+                recent = read(lambda store: store.observation_samples(window_start(freshness_seconds)))
+                lifetime = read(lambda store: store.client_lifetime())
+            health: dict[str, Any] = {"reachable": True, **self.store.capacity()}
+        except DashboardReadUnavailable as exc:
+            # Read-lane saturation is not an unreachable store. Reporting it as
+            # one produced the blocker "nothing can be persisted" while intake
+            # was healthy -- a false alarm about the wrong subsystem.
+            samples = {}
+            recent = {}
+            lifetime = {}
+            health = {"reachable": True, "degraded": True, "read_lane": str(exc)}
+        except Exception as exc:  # store unreachable is itself the finding
+            samples = {}
+            recent = {}
+            lifetime = {}
+            health = {"reachable": False, "error": str(exc)}
+        return observation_report(
+            samples,
+            recent_samples=recent,
+            lifetime_totals=lifetime,
+            configured_clients=managed,
+            store_health=health,
+            window_seconds=window_seconds,
+            freshness_seconds=freshness_seconds,
+        )
+
     def metrics(self) -> str:
-        with self.lock:
-            summary = self.store.summary()
-            conflicts = self.store.conflict_count()
-            # Keep Prometheus bounded while making the default dashboard catalog
-            # large enough that normal multi-project installations do not hide
-            # dimensions behind the old top-100 cutoff.
-            dimensions = self.store.metric_dimensions(limit=500)
-            ingest_batches = self.ingest_batches
-            ingest_records = self.ingest_records
-            ingest_rejected = self.ingest_rejected
-            ingest_unavailable = self.ingest_unavailable
-            capacity = self.store.capacity()
+        stats = self._stats_snapshot()
+        return self._read(lambda store: self._metrics_from_store(store, stats))
+
+    def _metrics_from_store(self, store: EventStore, stats: Mapping[str, int]) -> str:
+        summary = store.summary()
+        conflicts = store.conflict_count()
+        # Keep Prometheus bounded while making the default dashboard catalog
+        # large enough that normal multi-project installations do not hide
+        # dimensions behind the old top-100 cutoff.
+        dimensions = store.metric_dimensions(limit=500)
+        ingest_batches = stats["batches"]
+        ingest_records = stats["records"]
+        ingest_rejected = stats["rejected"]
+        ingest_unavailable = stats["unavailable"]
+        capacity = store.capacity()
         lines = [
             "# HELP observatory_process_ready Whether the normalizer process and store are ready.",
             "# TYPE observatory_process_ready gauge",
@@ -198,13 +554,13 @@ class ObservatoryApplication:
             f"observatory_event_failures_total {summary['failures']}",
             "# HELP observatory_ingest_ledger_entries_total Append-only intake attempts retained for audit.",
             "# TYPE observatory_ingest_ledger_entries_total gauge",
-            f"observatory_ingest_ledger_entries_total {self.store.ledger_count()}",
+            f"observatory_ingest_ledger_entries_total {store.ledger_count()}",
             "# HELP observatory_measurement_facts_total Field-level evidence facts retained.",
             "# TYPE observatory_measurement_facts_total gauge",
-            f"observatory_measurement_facts_total {self.store.measurement_count()}",
+            f"observatory_measurement_facts_total {store.measurement_count()}",
             "# HELP observatory_outcomes_total Correlated outcome observations retained.",
             "# TYPE observatory_outcomes_total gauge",
-            f"observatory_outcomes_total {self.store.outcome_count()}",
+            f"observatory_outcomes_total {store.outcome_count()}",
             "# HELP observatory_input_tokens_total Total input tokens reported in normalized events.",
             "# TYPE observatory_input_tokens_total gauge",
             f"observatory_input_tokens_total {_sample(summary['input_tokens'])}",
@@ -495,22 +851,27 @@ class ObservatoryApplication:
         return "\n".join(lines) + "\n"
 
     def prometheus_api(self, path: str, params: Mapping[str, list[str]]) -> dict[str, Any]:
-        with self.lock:
-            return self._prometheus_api_unlocked(path, params)
+        return self._read(lambda store: self._prometheus_api_unlocked(path, params, PrometheusQueryEngine(store)))
 
-    def _prometheus_api_unlocked(self, path: str, params: Mapping[str, list[str]]) -> dict[str, Any]:
+    def _prometheus_api_unlocked(
+        self,
+        path: str,
+        params: Mapping[str, list[str]],
+        prometheus: PrometheusQueryEngine | None = None,
+    ) -> dict[str, Any]:
         """Serve the bounded event-time Prometheus compatibility surface."""
 
+        prometheus = prometheus or self.prometheus
         if path == "/api/v1/query":
             query = _prometheus_param(params, "query")
-            return self.prometheus.query(query, params)
+            return prometheus.query(query, params)
         if path == "/api/v1/query_range":
             query = _prometheus_param(params, "query")
-            return self.prometheus.query_range(query, params)
+            return prometheus.query_range(query, params)
         if path == "/api/v1/labels":
-            return {"status": "success", "data": self.prometheus.labels()}
+            return {"status": "success", "data": prometheus.labels()}
         if path == "/api/v1/metadata":
-            return self.prometheus.metadata()
+            return prometheus.metadata()
         if path == "/api/v1/status/buildinfo":
             return {
                 "status": "success",
@@ -520,7 +881,7 @@ class ObservatoryApplication:
             selectors = params.get("match[]", [])
             if not selectors:
                 raise PrometheusQueryError("series requires at least one match[] selector")
-            return {"status": "success", "data": self.prometheus.series(selectors, params)}
+            return {"status": "success", "data": prometheus.series(selectors, params)}
         label_prefix = "/api/v1/label/"
         if path.startswith(label_prefix) and path.endswith("/values"):
             label = path[len(label_prefix) : -len("/values")]
@@ -532,7 +893,7 @@ class ObservatoryApplication:
                 metric_names.append(selector.split("{", 1)[0].strip())
             return {
                 "status": "success",
-                "data": self.prometheus.label_values(label, metric_names or None, params),
+                "data": prometheus.label_values(label, metric_names or None, params),
             }
         raise PrometheusQueryError("unsupported Prometheus API path")
 
@@ -632,11 +993,13 @@ class _Handler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(self.server.request_timeout)
 
-    def _send_json(self, status: int, value: Mapping[str, Any]) -> None:
+    def _send_json(self, status: int, value: Mapping[str, Any], *, headers: Mapping[str, str] | None = None) -> None:
         body = json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         if self.close_connection:
             self.send_header("Connection", "close")
         self.end_headers()
@@ -654,7 +1017,11 @@ class _Handler(BaseHTTPRequestHandler):
         """Require the configured bearer token without exposing its value."""
 
         expected = self.server.auth_token
-        if expected is None:
+        if expected is None or (
+            self.server.trust_loopback
+            and self.client_address
+            and _is_loopback_address(self.client_address[0])
+        ):
             return True
         header = self.headers.get("Authorization", "")
         scheme, separator, presented = header.partition(" ")
@@ -671,9 +1038,48 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         return False
 
+    def _send_read_unavailable(self, error: DashboardReadUnavailable, *, prometheus: bool = False) -> None:
+        if prometheus:
+            value: Mapping[str, Any] = {
+                "status": "error",
+                "errorType": "unavailable",
+                "error": "dashboard_query_unavailable",
+                "reason": error.reason,
+            }
+        else:
+            value = {"error": "dashboard_query_unavailable", "reason": error.reason}
+        self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, value, headers={"Retry-After": "1"})
+
+    def _plane_allows(self, path: str, method: str) -> bool:
+        plane = self.server.plane
+        if plane == "combined":
+            return True
+        if plane == "control":
+            return path in ("/healthz", "/readyz") or (
+                method == "POST" and path in ("/v1/events", "/v1/traces", "/v1/metrics", "/v1/logs")
+            )
+        if plane == "read":
+            if method != "GET":
+                return False
+            return path == "/readz" or path == "/metrics" or path.startswith("/api/v1/") or path in {
+                "/v1/summary",
+                "/v1/events",
+                "/v1/measurements",
+                "/v1/outcomes",
+                "/v1/attribution",
+                "/v1/analytics/comparison",
+                "/v1/analytics/engineering-value",
+                "/v1/analytics/outcome-value",
+                "/v1/observation",
+                "/v1/observation/history",
+            } or path.startswith("/v1/events/")
+        return False
+
     def _handle_prometheus(self, path: str, params: Mapping[str, list[str]]) -> None:
         try:
             self._send_json(HTTPStatus.OK, self.server.application.prometheus_api(path, params))
+        except DashboardReadUnavailable as exc:
+            self._send_read_unavailable(exc, prometheus=True)
         except sqlite3.Error:
             self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
                 "status": "error",
@@ -689,6 +1095,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
         parsed = urlsplit(self.path)
+        if not self._plane_allows(parsed.path, "GET"):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
         if parsed.path not in ("/healthz", "/readyz") and not self._require_authentication():
             return
         try:
@@ -717,8 +1126,21 @@ class _Handler(BaseHTTPRequestHandler):
                 status = HTTPStatus.SERVICE_UNAVAILABLE if parsed.path == "/readyz" and health.get("status") != "ok" else HTTPStatus.OK
                 self._send_json(status, health)
                 return
+            if parsed.path == "/readz":
+                self._send_json(HTTPStatus.OK, {"schema": "observatory.readiness/v1", "status": "ok", "plane": "read"})
+                return
             if parsed.path == "/metrics":
                 self._send_text(HTTPStatus.OK, self.server.application.metrics(), "text/plain; version=0.0.4")
+                return
+            if parsed.path == "/v1/observation/history":
+                self._send_json(HTTPStatus.OK, self.server.application.observation_reliability())
+                return
+            if parsed.path == "/v1/observation":
+                report = self.server.application.observation()
+                self._send_json(
+                    HTTPStatus.OK if report["observation_capable"] else HTTPStatus.SERVICE_UNAVAILABLE,
+                    report,
+                )
                 return
             if parsed.path == "/v1/summary":
                 self._send_json(HTTPStatus.OK, self.server.application.summary(_query_filters(parsed.query)))
@@ -743,7 +1165,15 @@ class _Handler(BaseHTTPRequestHandler):
             if parsed.path == "/v1/analytics/comparison":
                 self._send_json(HTTPStatus.OK, self.server.application.comparison(_query_filters(parsed.query), _query_limit(parsed.query, maximum=500)))
                 return
+            if parsed.path == "/v1/analytics/engineering-value":
+                self._send_json(HTTPStatus.OK, self.server.application.engineering_value(_query_filters(parsed.query), _query_limit(parsed.query, maximum=500)))
+                return
+            if parsed.path == "/v1/analytics/outcome-value":
+                self._send_json(HTTPStatus.OK, self.server.application.outcome_value(_query_filters(parsed.query), _query_limit(parsed.query, maximum=500)))
+                return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+        except DashboardReadUnavailable as exc:
+            self._send_read_unavailable(exc)
         except sqlite3.Error:
             self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "store_unavailable"})
         except (ValueError, RuntimeError) as exc:
@@ -751,6 +1181,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
         parsed = urlsplit(self.path)
+        if not self._plane_allows(parsed.path, "POST"):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
         if parsed.path.startswith("/api/v1/"):
             if not self._require_authentication():
                 return
@@ -834,6 +1267,8 @@ class _Handler(BaseHTTPRequestHandler):
                 signal = parsed.path.removeprefix("/v1/")
                 status, result = self.server.application.ingest_otlp(signal, value)
             self._send_json(status, result)
+        except DashboardReadUnavailable as exc:
+            self._send_read_unavailable(exc)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid_json: {exc}"})
 
@@ -854,6 +1289,8 @@ class ObservatoryHTTPServer(ThreadingHTTPServer):
         request_timeout: float = 10.0,
         max_concurrent_requests: int = 64,
         auth_token: str | None = None,
+        plane: str = "combined",
+        trust_loopback: bool = False,
     ) -> None:
         if request_timeout <= 0:
             raise ValueError("request_timeout must be positive")
@@ -861,10 +1298,14 @@ class ObservatoryHTTPServer(ThreadingHTTPServer):
             raise ValueError("max_concurrent_requests must be positive")
         if auth_token is not None and not auth_token:
             raise ValueError("auth_token must not be empty")
+        if plane not in {"combined", "control", "read"}:
+            raise ValueError("plane must be combined, control, or read")
         self.application = application
         self.request_timeout = request_timeout
         self._request_slots = BoundedSemaphore(max_concurrent_requests)
         self.auth_token = auth_token
+        self.plane = plane
+        self.trust_loopback = trust_loopback
         super().__init__(address, _Handler)
 
     def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
@@ -893,6 +1334,8 @@ def create_server(
     request_timeout: float = 10.0,
     max_concurrent_requests: int = 64,
     auth_token: str | None = None,
+    plane: str = "combined",
+    trust_loopback: bool = False,
 ) -> ObservatoryHTTPServer:
     return ObservatoryHTTPServer(
         (host, port),
@@ -900,6 +1343,8 @@ def create_server(
         request_timeout=request_timeout,
         max_concurrent_requests=max_concurrent_requests,
         auth_token=auth_token,
+        plane=plane,
+        trust_loopback=trust_loopback,
     )
 
 
@@ -912,18 +1357,47 @@ def serve(
     request_timeout: float = 10.0,
     max_concurrent_requests: int = 64,
     auth_token: str | None = None,
+    read_port: int | None = 8788,
+    trust_loopback: bool = False,
+    config_path: str | Path | None = None,
 ) -> None:
-    server = create_server(
-        host,
-        port,
-        db_path,
-        max_database_bytes=max_database_bytes,
-        request_timeout=request_timeout,
-        max_concurrent_requests=max_concurrent_requests,
-        auth_token=auth_token,
+    if read_port is not None and read_port == port:
+        raise ValueError("read_port must differ from port")
+    application = ObservatoryApplication(
+        EventStore(db_path, max_bytes=max_database_bytes),
+        config_path=config_path,
     )
+    servers = [
+        ObservatoryHTTPServer(
+            (host, port),
+            application,
+            request_timeout=request_timeout,
+            max_concurrent_requests=max_concurrent_requests,
+            auth_token=auth_token,
+            plane="control" if read_port is not None else "combined",
+            trust_loopback=trust_loopback,
+        )
+    ]
+    if read_port is not None:
+        servers.append(
+            ObservatoryHTTPServer(
+                (host, read_port),
+                application,
+                request_timeout=request_timeout,
+                max_concurrent_requests=max_concurrent_requests,
+                auth_token=auth_token,
+                plane="read",
+                trust_loopback=trust_loopback,
+            )
+        )
+    threads = [Thread(target=server.serve_forever, daemon=True) for server in servers]
     try:
-        server.serve_forever()
+        for thread in threads:
+            thread.start()
+        while any(thread.is_alive() for thread in threads):
+            time.sleep(0.25)
     finally:
-        server.server_close()
-        server.application.store.close()
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+        application.store.close()

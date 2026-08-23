@@ -16,7 +16,7 @@ from .contracts import canonical_json, stable_event_id
 from .intake import Intake, IntakeResult
 from .privacy import PrivacyPolicy, redact_mapping
 from .project import sanitize_remote
-from .store import EventStore
+from .store import UNKNOWN_PROJECT_ID, EventStore
 
 
 _MAX_ATTRIBUTES = 256
@@ -474,10 +474,81 @@ def _metric_record(
     }
 
 
+def _is_analytically_empty_span(record: Mapping[str, Any]) -> bool:
+    """True for a residual span that carries nothing any analysis can use.
+
+    `event_type` is already `otel.span` only when the span matched neither a
+    model nor a tool operation, so this is the leftover bucket. A span in it
+    earns storage by carrying at least one measurement (tokens, cost, latency,
+    duration), one identity (session, workflow, agent, task, project), one
+    reliability signal, or its own name. Carrying none of those, it cannot join
+    to a project, contribute to a cost or latency comparison, or be counted as
+    an outcome -- it only consumes the byte budget that longitudinal history
+    needs.
+
+    This is not a volume heuristic. Measured on the live store: codex-app-server
+    emitted 560,988 residual spans of which 560,462 (99.91%) carried a bare
+    model label and nothing else -- no usage, no latency, no session, no
+    project, no name -- while the 526 that carried usage or a session are
+    retained by this predicate. Raw spans remain queryable in Tempo, which is
+    fed by a separate unfiltered pipeline.
+    """
+
+    if record.get("event_type") != "otel.span":
+        return False
+    execution = record.get("execution") or {}
+    for key in ("session_id", "workflow_id", "agent_id", "subagent_id", "task_id"):
+        if execution.get(key):
+            return False
+    project = record.get("project") or {}
+    # `_project_identity` returns the literal "project:unknown" rather than
+    # None, so a truthiness test here would never fire.
+    if project.get("project_id") not in (None, "", UNKNOWN_PROJECT_ID):
+        return False
+    if any(project.get(key) for key in ("repository", "root", "remote", "worktree", "branch", "commit")):
+        return False
+    # `duration_ms` is derived from the span's own start/end timestamps, so
+    # EVERY span carries one -- including a 4.8-microsecond internal span with
+    # no name and no identity. Treating it as evidence made this predicate
+    # unable to drop anything. The record's own provenance draws the same line:
+    # `performance.duration_ms` is "derived" while `latency_ms` is "client".
+    # `usage.source` is a provenance label, not a measurement.
+    _DERIVED = {"usage": {"source"}, "performance": {"duration_ms"}}
+    for section in ("usage", "performance"):
+        ignored = _DERIVED[section]
+        if any(
+            value is not None
+            for key, value in (record.get(section) or {}).items()
+            if key not in ignored
+        ):
+            return False
+    reliability = record.get("reliability") or {}
+    if reliability.get("status") not in (None, "unknown"):
+        return False
+    for key, value in reliability.items():
+        if key == "status" or value is None:
+            continue
+        # A False flag or a zero count is a default, not a signal. `aborted`,
+        # `timeout` and `tool_failure` are stamped False on every ordinary span,
+        # so treating them as evidence kept 110,890 empty spans alive.
+        if value is False or value == 0:
+            continue
+        return False
+    # A named span is evidence of *something*, even without measurements.
+    if (record.get("attributes") or {}).get("span_name"):
+        return False
+    return True
+
+
 class OTLPJsonBridge:
     def __init__(self, store: EventStore, *, max_records: int = 256) -> None:
         self.store = store
         self.intake = Intake(store, max_records=max_records)
+        # Dropping is only defensible if it is visible. These counters are what
+        # let an operator distinguish "this client sent nothing" from "this
+        # client sent 560,000 spans that said nothing".
+        self.dropped_empty_spans = 0
+        self.dropped_empty_by_source: dict[str, int] = {}
 
     def ingest(self, signal: str, payload: Mapping[str, Any]) -> IntakeResult:
         # Stream the generator directly into bounded intake. Materializing an
@@ -699,6 +770,15 @@ class OTLPJsonBridge:
                         "attributes": _safe_attributes(resource_attrs, attrs),
                         "extensions": _extensions(resource_attrs, attrs),
                     }
+                    if _is_analytically_empty_span(record):
+                        # Counted, never silently discarded: coverage must be
+                        # able to say "N spans arrived carrying nothing" rather
+                        # than report this client as having sent zero telemetry.
+                        self.dropped_empty_spans += 1
+                        self.dropped_empty_by_source[source_name] = (
+                            self.dropped_empty_by_source.get(source_name, 0) + 1
+                        )
+                        continue
                     yield record
         if not saw_span:
             yield {}
