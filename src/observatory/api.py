@@ -1059,6 +1059,11 @@ class _Handler(BaseHTTPRequestHandler):
                 method == "POST" and path in ("/v1/events", "/v1/traces", "/v1/metrics", "/v1/logs")
             )
         if plane == "read":
+            # Grafana 12's Prometheus plugin POSTs /api/v1/query and
+            # /api/v1/query_range even when the datasource is provisioned as GET.
+            # Admit those POSTs; keep every other write off this plane.
+            if method == "POST" and path.startswith("/api/v1/"):
+                return True
             if method != "GET":
                 return False
             return path == "/readz" or path == "/metrics" or path.startswith("/api/v1/") or path in {
