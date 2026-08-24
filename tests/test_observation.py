@@ -323,7 +323,14 @@ class LongitudinalReliabilityTests(unittest.TestCase):
         # but nobody looking. Silence must never read as "no problems".
         self._snapshot(0, True)
         self._snapshot(60 * 24, True)
-        gaps = self.store.observation_gaps(expected_interval_seconds=3600)
+        # Pin the clock to the last snapshot.  observation_gaps also reports a
+        # trailing gap to *now* by design, so leaving that to the wall clock
+        # made this assertion start counting two intervals an hour after the
+        # anchor date passed.
+        gaps = self.store.observation_gaps(
+            expected_interval_seconds=3600,
+            now=(NOW + timedelta(minutes=60 * 24)).isoformat(),
+        )
         self.assertEqual(len(gaps["unwatched_intervals"]), 1)
         self.assertAlmostEqual(gaps["unwatched_intervals"][0]["seconds"], 86400.0, places=1)
         self.assertEqual(gaps["not_capable_intervals"], [])
