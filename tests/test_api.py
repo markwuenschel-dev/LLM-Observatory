@@ -251,6 +251,17 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(get(read.server_port, "/readz"), 200)
             self.assertEqual(get(read.server_port, "/v1/summary"), 200)
             self.assertEqual(get(read.server_port, "/v1/events", method="POST", value=event_mapping()), 404)
+            form = urlencode({"query": "1"}).encode("utf-8")
+            request = Request(
+                f"http://127.0.0.1:{read.server_port}/api/v1/query",
+                data=form,
+                method="POST",
+            )
+            request.add_header("Content-Type", "application/x-www-form-urlencoded")
+            with urlopen(request, timeout=3) as response:
+                self.assertEqual(response.status, 200)
+                posted = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(posted["status"], "success")
         finally:
             for server, thread in ((control, control_thread), (read, read_thread)):
                 server.shutdown()
@@ -358,7 +369,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(labels["status"], "success")
         self.assertEqual(sorted(labels["data"]), ["repo:prometheus-repo-0", "repo:prometheus-repo-1"])
 
-        form = urlencode({"query": "sum(observatory_events_by_context_total)"}).encode("utf-8")
+        form = urlencode({
+            "query": "sum(observatory_events_by_context_total)",
+            "time": "2026-08-07T14:10:00Z",
+        }).encode("utf-8")
         request = Request(self.base + "/api/v1/query", data=form, method="POST")
         request.add_header("Content-Type", "application/x-www-form-urlencoded")
         with urlopen(request, timeout=3) as response:

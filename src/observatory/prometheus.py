@@ -325,6 +325,15 @@ _MAX_QUERY_ROWS = min(_MAX_MATRIX_VALUES, _MAX_MATRIX_SERIES * 64) + 1
 # every selector family inside a finite lookback even when a caller omits
 # start/end or asks for an instant cumulative value.
 _MAX_LOOKBACK_SECONDS = 366.0 * 24.0 * 60.0 * 60.0
+# Instant queries are Grafana stat tiles. They send `time` (usually `now`)
+# and no start, so a 366-day lookback scans the whole store and 503s the
+# 2s dashboard budget. Match the provisioned dashboard default of 24h.
+_DEFAULT_INSTANT_LOOKBACK_SECONDS = 24.0 * 60.0 * 60.0
+# Grafana's All option is `$__all` in the URL. When label_values fail or the
+# variable never expands, dashboards send `project=~"$__all"`. `$` is end-of
+# string in PromQL regex, so that matcher matches nothing and every panel
+# renders No data against a full store.
+_REGEX_MATCHES_ALL = frozenset({".*", "^.*$", "$__all", "__all"})
 
 
 def _parse_time(value: str | None, *, default: float) -> float:
@@ -376,7 +385,7 @@ def _time_window(params: Mapping[str, list[str]], *, instant: bool) -> tuple[flo
     now = time.time()
     if instant:
         at = _parse_time(one("time"), default=now)
-        start = max(at - _MAX_LOOKBACK_SECONDS, 0.0)
+        start = max(at - _DEFAULT_INSTANT_LOOKBACK_SECONDS, 0.0)
         return start, at, max(at - start, 1.0), 1
     start = _parse_time(one("start"), default=max(now - 86_400.0, 0.0))
     end = _parse_time(one("end"), default=now)
@@ -538,10 +547,33 @@ def _format_value(value: float) -> str:
     return format(value, ".15g")
 
 
-def _format_timestamp(value: float) -> str:
+def _format_timestamp(value: float) -> int | float:
+    """Prometheus JSON uses numeric unix timestamps, string sample values.
+
+    Grafana 12's Prometheus parser (`readNumberAsString`) rejects a quoted
+    timestamp and renders every panel as No data even when the query is 200.
+    """
+
     if value.is_integer():
-        return str(int(value))
-    return format(value, ".15g")
+        return int(value)
+    return float(value)
+
+
+def _sqlite_re_fullmatch(pattern: object, value: object) -> int:
+    if not isinstance(pattern, str) or not isinstance(value, str):
+        return 0
+    try:
+        return 1 if re.fullmatch(pattern, value) is not None else 0
+    except re.error:
+        return 0
+
+
+def _can_push_aggregate(function: str, definition: _MetricDefinition) -> bool:
+    if function == "sum":
+        return definition.aggregate in {"count", "sum", "flag"}
+    if function == "avg":
+        return definition.aggregate == "avg"
+    return False
 
 
 class PrometheusQueryEngine:
@@ -549,6 +581,9 @@ class PrometheusQueryEngine:
 
     def __init__(self, store: EventStore) -> None:
         self.store = store
+        self.store.connection.create_function(
+            "prom_re_fullmatch", 2, _sqlite_re_fullmatch, deterministic=True
+        )
 
     @staticmethod
     def _matches(labels: Mapping[str, str], matchers: Iterable[_Matcher]) -> bool:
@@ -578,7 +613,45 @@ class PrometheusQueryEngine:
     def _iso(value: float) -> str:
         return datetime.fromtimestamp(value, timezone.utc).isoformat()
 
-    def _base_matrix(self, selector: _Selector, start: float, end: float, step: float, points: int) -> list[_Series]:
+    def _matcher_sql(self, definition: _MetricDefinition, matchers: Iterable[_Matcher]) -> tuple[str, list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        for matcher in matchers:
+            if matcher.label == "__name__":
+                continue
+            expr = definition.label_sql[matcher.label]
+            if matcher.value in _REGEX_MATCHES_ALL:
+                if matcher.operator in {"=", "=~"}:
+                    continue
+                if matcher.operator in {"!=", "!~"}:
+                    clauses.append("0")
+                    continue
+            if matcher.operator == "=":
+                clauses.append(f"{expr} = ?")
+                params.append(matcher.value)
+            elif matcher.operator == "!=":
+                clauses.append(f"{expr} != ?")
+                params.append(matcher.value)
+            elif matcher.operator == "=~":
+                clauses.append(f"prom_re_fullmatch(?, {expr})")
+                params.append(matcher.value)
+            elif matcher.operator == "!~":
+                clauses.append(f"NOT prom_re_fullmatch(?, {expr})")
+                params.append(matcher.value)
+            else:
+                raise PrometheusQueryError(f"unsupported Prometheus matcher {matcher.operator}")
+        if not clauses:
+            return "1 = 1", []
+        return " AND ".join(clauses), params
+
+    def _matrix_sql(
+        self,
+        selector: _Selector,
+        start: float,
+        end: float,
+        step: float,
+        group_by: tuple[str, ...],
+    ) -> tuple[str, tuple[Any, ...]]:
         definition = METRIC_DEFINITIONS.get(selector.metric)
         if definition is None:
             raise PrometheusQueryError(f"unsupported event-time metric: {selector.metric}")
@@ -587,7 +660,12 @@ class PrometheusQueryEngine:
             raise PrometheusQueryError(
                 f"metric {selector.metric} does not expose label {sorted(unknown_labels)[0]}"
             )
-        labels_sql = [f"{definition.label_sql[label]} AS {label}" for label in definition.labels]
+        unknown_group = set(group_by) - set(definition.labels)
+        if unknown_group:
+            raise PrometheusQueryError(
+                f"metric {selector.metric} does not expose label {sorted(unknown_group)[0]}"
+            )
+        labels_sql = [f"{definition.label_sql[label]} AS {label}" for label in group_by]
         bucket_sql = (
             # A sample at t represents all events through t.  Ceil the
             # event's offset so an event at 14:09 appears at the 14:10 sample,
@@ -617,16 +695,91 @@ class PrometheusQueryEngine:
         else:
             raise PrometheusQueryError(f"metric {selector.metric} has unsupported aggregate")
 
-        group_parts = ["bucket", *(definition.label_sql[label] for label in definition.labels)]
+        matcher_sql, matcher_params = self._matcher_sql(definition, selector.matchers)
+        group_parts = ["bucket", *(definition.label_sql[label] for label in group_by)]
         query = (
             f"SELECT {', '.join(select_parts)} FROM {definition.from_sql} "
             f"WHERE {definition.observed_sql} >= ? AND {definition.observed_sql} <= ? "
-            f"AND {definition.where_sql} GROUP BY {', '.join(group_parts)} ORDER BY bucket LIMIT ?"
+            f"AND {definition.where_sql} AND {matcher_sql} "
+            f"GROUP BY {', '.join(group_parts)} ORDER BY bucket LIMIT ?"
         )
-        rows = self.store.connection.execute(
-            query,
-            (self._iso(start), step, step, self._iso(start), self._iso(end), _MAX_QUERY_ROWS),
-        ).fetchall()
+        params = (
+            self._iso(start),
+            step,
+            step,
+            self._iso(start),
+            self._iso(end),
+            *matcher_params,
+            _MAX_QUERY_ROWS,
+        )
+        return query, params
+
+    def matrix_sql(self, expression: str, *, start: str, end: str, step: float) -> tuple[str, tuple[Any, ...]]:
+        """SQL for a pushed-down sum/avg selector. Tests assert the covering index."""
+
+        start_ts = _parse_time(start, default=0.0)
+        end_ts = _parse_time(end, default=0.0)
+        selector, group_by = self._pushed_selector(expression)
+        if selector is None:
+            raise PrometheusQueryError("expression is not a pushed-down PromQL aggregate")
+        return self._matrix_sql(selector, start_ts, end_ts, step, group_by)
+
+    def _pushed_selector(self, expression: str) -> tuple[_Selector | None, tuple[str, ...]]:
+        text = _strip_outer_parentheses(expression)
+        for function in ("sum", "avg", "max", "count"):
+            prefix = f"{function} by ("
+            if text.startswith(prefix):
+                label_end = text.find(")", len(prefix))
+                if label_end < 0:
+                    return None, ()
+                labels = tuple(label.strip() for label in text[len(prefix):label_end].split(",") if label.strip())
+                rest = text[label_end + 1 :].strip()
+                if not rest.startswith("(") or _matching_close(rest, 0) != len(rest) - 1:
+                    return None, ()
+                inner = rest[1:-1]
+                return self._pushed_inner(function, inner, labels)
+            prefix = f"{function}("
+            if text.startswith(prefix):
+                close = _matching_close(text, len(function))
+                if close != len(text) - 1:
+                    return None, ()
+                inner = text[len(prefix) : -1]
+                return self._pushed_inner(function, inner, ())
+        return None, ()
+
+    def _pushed_inner(
+        self, function: str, inner: str, group_by: tuple[str, ...]
+    ) -> tuple[_Selector | None, tuple[str, ...]]:
+        try:
+            selector = _parse_selector(_strip_outer_parentheses(inner))
+        except PrometheusQueryError:
+            return None, ()
+        definition = METRIC_DEFINITIONS.get(selector.metric)
+        if definition is None or not _can_push_aggregate(function, definition):
+            return None, ()
+        if set(group_by) - set(definition.labels):
+            return None, ()
+        return selector, group_by
+
+    def _base_matrix(
+        self,
+        selector: _Selector,
+        start: float,
+        end: float,
+        step: float,
+        points: int,
+        *,
+        group_by: tuple[str, ...] | None = None,
+    ) -> list[_Series]:
+        definition = METRIC_DEFINITIONS.get(selector.metric)
+        if definition is None:
+            raise PrometheusQueryError(f"unsupported event-time metric: {selector.metric}")
+        for matcher in selector.matchers:
+            if matcher.label == "__name__" and not self._matches({"__name__": selector.metric}, (matcher,)):
+                return []
+        resolved_group = definition.labels if group_by is None else group_by
+        query, params = self._matrix_sql(selector, start, end, step, resolved_group)
+        rows = self.store.connection.execute(query, params).fetchall()
         if len(rows) >= _MAX_QUERY_ROWS:
             raise PrometheusQueryError(f"Prometheus query exceeds the {_MAX_QUERY_ROWS - 1}-row evaluation budget")
 
@@ -634,10 +787,8 @@ class PrometheusQueryEngine:
         labels_by_key: dict[tuple[tuple[str, str], ...], dict[str, str]] = {}
         valid_by_key: dict[tuple[tuple[str, str], ...], set[int]] = {}
         for row in rows:
-            labels = {label: str(row[label]) for label in definition.labels}
+            labels = {label: str(row[label]) for label in resolved_group}
             labels["__name__"] = selector.metric
-            if not self._matches(labels, selector.matchers):
-                continue
             key = tuple(sorted(labels.items()))
             if key not in contributions and len(contributions) >= _MAX_MATRIX_SERIES:
                 raise PrometheusQueryError(
@@ -775,14 +926,22 @@ class PrometheusQueryEngine:
                 rest = text[label_end + 1 :].strip()
                 if not rest.startswith("(") or _matching_close(rest, 0) != len(rest) - 1:
                     raise PrometheusQueryError("invalid grouped Prometheus aggregate")
-                inner = self._evaluate(rest[1:-1], start, end, step, points)
+                inner_text = rest[1:-1]
+                selector, group_by = self._pushed_inner(function, inner_text, labels)
+                if selector is not None:
+                    return self._base_matrix(selector, start, end, step, points, group_by=group_by)
+                inner = self._evaluate(inner_text, start, end, step, points)
                 return self._aggregate(inner, function, labels, points)
             prefix = f"{function}("
             if text.startswith(prefix):
                 close = _matching_close(text, len(function))
                 if close != len(text) - 1:
                     raise PrometheusQueryError(f"invalid {function} expression")
-                inner = self._evaluate(text[len(prefix) : -1], start, end, step, points)
+                inner_text = text[len(prefix) : -1]
+                selector, group_by = self._pushed_inner(function, inner_text, ())
+                if selector is not None:
+                    return self._base_matrix(selector, start, end, step, points, group_by=group_by)
+                inner = self._evaluate(inner_text, start, end, step, points)
                 return self._aggregate(inner, function, (), points)
 
         return self._base_matrix(_parse_selector(text), start, end, step, points)
@@ -842,7 +1001,7 @@ class PrometheusQueryEngine:
         end = _parse_time(end_values[0] if end_values else None, default=now)
         start = _parse_time(
             start_values[0] if start_values else None,
-            default=max(end - _MAX_LOOKBACK_SECONDS, 0.0),
+            default=max(end - _DEFAULT_INSTANT_LOOKBACK_SECONDS, 0.0),
         )
         if end < start:
             raise PrometheusQueryError("Prometheus end must be after or equal to start")
@@ -878,7 +1037,7 @@ class PrometheusQueryEngine:
         now = _parse_time(end_values[0] if end_values else None, default=time.time())
         start = _parse_time(
             start_values[0] if start_values else None,
-            default=max(now - _MAX_LOOKBACK_SECONDS, 0.0),
+            default=max(now - _DEFAULT_INSTANT_LOOKBACK_SECONDS, 0.0),
         )
         if now < start:
             raise PrometheusQueryError("Prometheus end must be after or equal to start")

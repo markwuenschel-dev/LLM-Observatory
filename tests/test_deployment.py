@@ -194,9 +194,9 @@ class DeploymentTests(unittest.TestCase):
         datasource_text = (ROOT / "deployment/grafana/provisioning/datasources/datasources.yaml").read_text(encoding="utf-8")
         self.assertIn("Observatory Events", datasource_text)
         self.assertIn("url: http://host.docker.internal:8788", datasource_text)
-        # The Observatory Events source targets the GET-only host read plane;
-        # a POST datasource 404s every panel.  Scope the assertion to that block
-        # so the separate real-Prometheus source may keep POST.
+        # Provision GET for clients that honor it. Grafana 12 POSTs anyway;
+        # the read plane admits POST only under /api/v1/. Scope this block so
+        # the separate real-Prometheus source may keep POST.
         events_block = datasource_text[datasource_text.index("- name: Observatory Events"):]
         following = events_block.find(chr(10) + "  - name:", 1)
         if following != -1:
