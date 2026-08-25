@@ -425,8 +425,9 @@ def _metric_record(
     usage = {
         "input_tokens": _number(_first_value(identity, "gen_ai.usage.input_tokens", "input_tokens")),
         "output_tokens": _number(_first_value(identity, "gen_ai.usage.output_tokens", "output_tokens")),
-        "cached_tokens": _number(_first_value(identity, "gen_ai.usage.cache_read.input_tokens", "cache_read_tokens")),
+        "cached_tokens": _number(_first_value(identity, "gen_ai.usage.cached_tokens", "cached_tokens")),
         "cache_creation_tokens": _number(_first_value(identity, "gen_ai.usage.cache_creation.input_tokens", "cache_creation_tokens")),
+        "cache_read_tokens": _number(_first_value(identity, "gen_ai.usage.cache_read.input_tokens", "cache_read_tokens")),
         "total_tokens": _number(_first_value(identity, "gen_ai.usage.total_tokens", "total_tokens")),
         "cost": _number(_first_value(identity, "gen_ai.usage.cost", "cost_usd")),
         "source": source_evidence,
@@ -701,7 +702,7 @@ class OTLPJsonBridge:
                         "usage": {
                             "input_tokens": _first_value(attrs, "gen_ai.usage.input_tokens", "input_tokens"),
                             "output_tokens": _first_value(attrs, "gen_ai.usage.output_tokens", "output_tokens"),
-                            "cached_tokens": _first_value(attrs, "gen_ai.usage.cached_tokens", "cache_read_tokens"),
+                            "cached_tokens": _first_value(attrs, "gen_ai.usage.cached_tokens", "cached_tokens"),
                             "cache_creation_tokens": _first_value(attrs, "gen_ai.usage.cache_creation.input_tokens", "cache_creation_tokens"),
                             "cache_read_tokens": _first_value(attrs, "gen_ai.usage.cache_read.input_tokens", "cache_read_tokens"),
                             "reasoning_tokens": attrs.get("gen_ai.usage.reasoning_tokens"),
@@ -920,7 +921,7 @@ class OTLPJsonBridge:
                         "usage": {
                             "input_tokens": _number(_first_value(attrs, "gen_ai.usage.input_tokens", "input_tokens")),
                             "output_tokens": _number(_first_value(attrs, "gen_ai.usage.output_tokens", "output_tokens")),
-                            "cached_tokens": _number(_first_value(attrs, "gen_ai.usage.cached_tokens", "cache_read_tokens")),
+                            "cached_tokens": _number(_first_value(attrs, "gen_ai.usage.cached_tokens", "cached_tokens")),
                             "cache_creation_tokens": _number(_first_value(attrs, "gen_ai.usage.cache_creation.input_tokens", "cache_creation_tokens")),
                             "cache_read_tokens": _number(_first_value(attrs, "gen_ai.usage.cache_read.input_tokens", "cache_read_tokens")),
                             "reasoning_tokens": _number(attrs.get("gen_ai.usage.reasoning_tokens")),
