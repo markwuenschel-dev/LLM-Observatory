@@ -269,7 +269,14 @@ class OTLPBridgeTests(unittest.TestCase):
                 self.assertEqual(event.execution.session_id, "claude-session")
                 self.assertEqual(event.usage.input_tokens, 11)
                 self.assertEqual(event.usage.output_tokens, 7)
-                self.assertEqual(event.usage.cached_tokens, 2)
+                # A client that reports only cache-read tokens populates
+                # cache_read_tokens and leaves cached_tokens unreported. The two
+                # are separate metric families; writing one value into both would
+                # count the same tokens twice. Matches the provider-response rule
+                # asserted by test_adapters
+                # .test_provider_response_adapter_does_not_alias_cache_read_as_cached_total.
+                self.assertIsNone(event.usage.cached_tokens)
+                self.assertEqual(event.usage.cache_read_tokens, 2)
                 self.assertEqual(event.usage.cache_creation_tokens, 3)
                 self.assertEqual(event.usage.cost, 0.001)
                 self.assertEqual(event.performance.duration_ms, 19)
@@ -279,6 +286,47 @@ class OTLPBridgeTests(unittest.TestCase):
                 self.assertEqual(event.execution.parent_agent_id, "claude-parent")
                 self.assertEqual(event.reliability.retry_count, 2)
                 self.assertEqual(event.reliability.status, "succeeded")
+
+    def test_cache_read_tokens_are_never_aliased_into_cached_tokens(self) -> None:
+        """`cached_tokens` and `cache_read_tokens` are separate metric families.
+
+        A client that reports only cache-read tokens must populate
+        `cache_read_tokens` and leave `cached_tokens` unreported. Writing one
+        value into both counts the same tokens twice, across
+        `observatory_cached_tokens_total` and
+        `observatory_cache_read_tokens_total`. The provider-response adapter
+        already enforces this; these assertions pin the same rule on the span
+        and metric paths, which previously used `cache_read_tokens` as the
+        fallback for both fields.
+        """
+        span = deepcopy(TRACE_PAYLOAD)
+        span["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"].append(
+            {"key": "cache_read_tokens", "value": {"intValue": "5"}}
+        )
+        metrics = {"resourceMetrics": [{"resource": {"attributes": [
+            {"key": "service.name", "value": {"stringValue": "metric-client"}},
+            {"key": "model", "value": {"stringValue": "metric-model"}},
+            # Metric-path usage is read from resource attributes: the datapoint
+            # identity filter (_METRIC_IDENTITY_ATTRIBUTES) carries dimensions
+            # only, so a token count on a datapoint never reaches the mapping.
+            {"key": "cache_read_tokens", "value": {"intValue": "7"}},
+        ]}, "scopeMetrics": [{"scope": {"name": "metric-scope", "version": "1"}, "metrics": [{
+            "name": "llm.events", "unit": "events", "gauge": {"dataPoints": [{
+                "asInt": "1", "timeUnixNano": "1786111200000000000", "attributes": [],
+            }]},
+        }]}]}]}
+
+        with tempfile.TemporaryDirectory() as temp:
+            with EventStore(Path(temp) / "events.sqlite3") as store:
+                bridge = OTLPJsonBridge(store)
+                bridge.ingest("traces", span)
+                bridge.ingest("metrics", metrics)
+                traced = store.list_events({"event_type": "model.operation"})[0]
+                self.assertIsNone(traced.usage.cached_tokens)
+                self.assertEqual(traced.usage.cache_read_tokens, 5)
+                metric = store.list_events({"event_type": "telemetry.metric"})[0]
+                self.assertIsNone(metric.usage.cached_tokens)
+                self.assertEqual(metric.usage.cache_read_tokens, 7)
 
     def test_log_numeric_rate_limit_error_is_normalized_as_failed_rate_limited(self) -> None:
         logs = {"resourceLogs": [{"resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "log-client"}}]}, "scopeLogs": [{"logRecords": [{"timeUnixNano": "1786111200000000000", "attributes": [
